@@ -251,6 +251,24 @@ def _get_ac_clients():
     return _ac_data_client, _ac_control_client
 
 
+def warmup() -> None:
+    """
+    Pre-build the AgentCore Memory clients at startup so the first customer
+    request doesn't pay the ~1-2s boto3 client-init cost. Safe no-op unless the
+    agentcore backend is active. Call once during app/container startup.
+    """
+    if SESSION_BACKEND != "agentcore":
+        return
+    try:
+        import time as _t
+        _t0 = _t.perf_counter()
+        _get_ac_clients()
+        logger.info("[SESSION:agentcore] warmup complete in %d ms",
+                    int((_t.perf_counter() - _t0) * 1000))
+    except Exception as exc:
+        logger.warning("[SESSION:agentcore] warmup failed (will lazy-init on first request): %s", exc)
+
+
 def _agentcore_get(conversation_id: str) -> SessionState | None:
     """
     Read session from AgentCore short-term memory.

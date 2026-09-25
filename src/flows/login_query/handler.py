@@ -105,13 +105,13 @@ def handle_login_query(state: SessionState, customer_message: str) -> tuple[Inte
     fs = state.flow_state
 
     if fs == "start":
-        from src.gateways.customer_api import get_customer_profile
+        from src.core.strands_agent import get_profile
         _ERROR_MSG = (
             "We were unable to retrieve your account information at this time.\n\n"
             "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
         )
         try:
-            profile       = get_customer_profile(state.sub_account_id or "")
+            profile       = get_profile(state.sub_account_id or "")
             if not profile or not hasattr(profile, "account_status"):
                 raise ValueError("Empty profile")
             acct_status   = profile.account_status

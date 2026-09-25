@@ -53,7 +53,8 @@ def handle_account_details(state: SessionState, customer_message: str) -> tuple[
         api_failed = False
 
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            from src.core.strands_agent import get_profile
+            profile = get_profile(state.sub_account_id or "")
             raw     = profile.raw.get("data", profile.raw)
 
             # If profile is empty dict (API returned nothing), treat as failure

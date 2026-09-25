@@ -165,6 +165,23 @@ app.include_router(web_router)          # POST /api/chat  (public — Simcomm)
 app.include_router(internal_router)     # /internal/*     (dev only)
 
 
+# ── Startup: warm the AgentCore Memory clients ────────────────────────────────
+# Pre-builds the boto3 clients so the first customer request doesn't pay the
+# ~1-2s client-init cost (moves it into server startup instead).
+@app.on_event("startup")
+def _warmup_memory():
+    try:
+        from src.core.session_store import warmup as _mem_warmup
+        _mem_warmup()
+    except Exception as exc:
+        logging.warning("memory warmup skipped: %s", exc)
+    try:
+        from src.core.strands_agent import warmup as _agent_warmup
+        _agent_warmup()
+    except Exception as exc:
+        logging.warning("agent warmup skipped: %s", exc)
+
+
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))

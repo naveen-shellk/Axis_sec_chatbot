@@ -131,9 +131,9 @@ def handle_brokerage(
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.gateways.customer_api import get_customer_profile
+        from src.core.strands_agent import get_profile
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
         except Exception:
             status = "active"
@@ -194,7 +194,16 @@ def handle_brokerage(
             from src.gateways.customer_api import get_customer_profile, mask_email
 
             today_str = date.today().strftime("%d-%m-%Y")
-            ledger    = get_ledger(state.sub_account_id or "", today_str, today_str)
+            ledger    = None
+            try:
+                from src.core.strands_agent import run_tool
+                ledger = run_tool("get_ledger_balance",
+                                  sub_account_id=state.sub_account_id or "",
+                                  start_date=today_str, end_date=today_str)
+            except Exception as exc:
+                logger.warning("[BROKERAGE] agent tool path failed: %s — direct fallback", exc)
+            if ledger is None:
+                ledger = get_ledger(state.sub_account_id or "", today_str, today_str)
 
             if not ledger.get("success", False):
                 _err = (
@@ -215,7 +224,8 @@ def handle_brokerage(
                 )
 
             try:
-                profile = get_customer_profile(state.sub_account_id or "")
+                from src.core.strands_agent import get_profile
+                profile = get_profile(state.sub_account_id or "")
                 masked  = mask_email(profile.registered_email) or "your registered email"
             except Exception:
                 masked = "your registered email"
@@ -279,7 +289,16 @@ def handle_brokerage(
         from src.gateways.statement_api import send_dp_bill
         from src.gateways.customer_api import get_customer_profile, mask_email
 
-        result = send_dp_bill(state.sub_account_id or "", selected_date, selected_date)
+        result = None
+        try:
+            from src.core.strands_agent import run_tool
+            result = run_tool("send_dp_bill",
+                              sub_account_id=state.sub_account_id or "",
+                              start_date=selected_date, end_date=selected_date)
+        except Exception as exc:
+            logger.warning("[BROKERAGE] agent tool path failed: %s — direct fallback", exc)
+        if result is None:
+            result = send_dp_bill(state.sub_account_id or "", selected_date, selected_date)
 
         if not result.get("success", False):
             _err = (
@@ -300,7 +319,8 @@ def handle_brokerage(
             )
 
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            from src.core.strands_agent import get_profile
+            profile = get_profile(state.sub_account_id or "")
             masked  = mask_email(profile.registered_email) or "your registered email"
         except Exception:
             masked = result.get("masked_email", "your registered email")

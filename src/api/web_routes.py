@@ -331,14 +331,16 @@ def chat(
     total_out    = t_tokens["output_tokens"]
     call_count   = t_tokens["llm_call_count"]
 
-    # Split: first call = intent (Haiku), rest = response (Qwen)
-    if call_count >= 2:
-        intent_in    = total_in  // call_count
-        intent_out   = total_out // call_count
-        response_in  = total_in  - intent_in
-        response_out = total_out - intent_out
-    else:
-        intent_in = intent_out = 0
+    # Use the REAL per-model token counts tracked in the turn accumulator
+    # (handler.py records intent_* for Haiku, response_* for Qwen). Only fall
+    # back to an even split if those weren't populated for some reason.
+    from src.core.conversation import _turn_tokens as _tt_raw
+    intent_in    = _tt_raw.get("intent_input_tokens",    0)
+    intent_out   = _tt_raw.get("intent_output_tokens",   0)
+    response_in  = _tt_raw.get("response_input_tokens",  0)
+    response_out = _tt_raw.get("response_output_tokens", 0)
+    if (intent_in + intent_out + response_in + response_out) == 0 and (total_in + total_out) > 0:
+        # Nothing was attributed — attribute everything to response as a fallback.
         response_in, response_out = total_in, total_out
 
     session_after = get_session(conv_id)

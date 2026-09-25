@@ -119,6 +119,74 @@ def get_customer_profile(sub_account_id: str) -> dict:
         return {"error": str(exc), "account_status": "active"}
 
 
+@tool
+def get_customer_profile_full(sub_account_id: str) -> dict:
+    """
+    Fetch the COMPLETE customer profile as a serialisable dict, including every
+    field the flow handlers need (name, emails, account/demat/trading numbers,
+    status, and the full raw API envelope under "raw").
+
+    Use this when a flow needs detailed profile data (Account Details, Closure,
+    Login Query, etc.). Returns the same data as the CustomerProfile dataclass.
+    Auth: X-headers only — no Basic Auth required.
+    """
+    try:
+        from src.gateways.customer_api import get_customer_profile as _typed
+        p = _typed(sub_account_id)
+        return {
+            "sub_account_id":       p.sub_account_id,
+            "account_status":       p.account_status,
+            "name":                 p.name,
+            "registered_email":     p.registered_email,
+            "phone":                p.phone,
+            "account_opening_date": p.account_opening_date,
+            "portal_status":        p.portal_status,
+            "deactivation_code":    p.deactivation_code,
+            "deactivation_reason":  p.deactivation_reason,
+            "demat_account_no":     p.demat_account_no,
+            "trading_account_no":   p.trading_account_no,
+            "raw":                  p.raw,
+        }
+    except Exception as exc:
+        logger.error("[TOOL] get_customer_profile_full failed: %s", exc)
+        return {"error": str(exc), "account_status": "active", "raw": {}}
+
+
+@tool
+def create_account_closure(
+    sub_account_id: str,
+    email: str,
+    name: str,
+    type_of_account_closure: str = "demat",
+    dp_account_no: str = "",
+) -> dict:
+    """
+    Submit an account-closure request to the closure API for the given account.
+    Returns the API's raw response (used to detect already-closed / in-progress /
+    eligible scenarios).
+
+    Args:
+        sub_account_id:          Customer sub-account ID (ent_id).
+        email:                   Registered email (required by the API).
+        name:                    Customer name (for remarks).
+        type_of_account_closure: "demat" | "trading" | "demat_and_trading".
+        dp_account_no:           Optional DP account number.
+
+    Returns:
+        The closure API response dict (e.g. {"api_response": {"reason": "..."}}).
+    """
+    try:
+        from src.gateways.gateway_client import create_closure_request
+        return create_closure_request(
+            sub_account_id, email, name,
+            type_of_account_closure=type_of_account_closure,
+            dp_account_no=dp_account_no,
+        )
+    except Exception as exc:
+        logger.error("[TOOL] create_account_closure failed: %s", exc)
+        return {"api_response": {"reason": "error"}, "error": str(exc)}
+
+
 # =============================================================================
 # STATEMENT / REPORTS — Basic Auth (REPORTS_USERNAME / REPORTS_PASSWORD)
 # =============================================================================
@@ -298,6 +366,8 @@ ALL_TOOLS = [
     escalate_to_agent,
     get_account_status,
     get_customer_profile,
+    get_customer_profile_full,
+    create_account_closure,
     get_todays_orders,
     send_order_history_email,
     # Basic Auth (REPORTS_USERNAME / REPORTS_PASSWORD)

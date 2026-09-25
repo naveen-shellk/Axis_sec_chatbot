@@ -355,53 +355,11 @@ def handle_how_to_trade(
 
     # ── Account status check after instructions (post-login only) ─────────────
     if fs == "account_status_check":
-        from src.gateways.customer_api import get_customer_profile
-        try:
-            profile = get_customer_profile(state.sub_account_id or "")
-            status  = profile.account_status
-        except Exception:
-            status = "active"
-
-        if status in ("deactivated", "purged"):
-            deact_msg = (
-                f"We noticed your account is currently {status}. "
-                "Please contact our support team to reactivate:\n\n"
-                "📞 Customer Care: 022-40508080 / 022-61480808\n"
-                "🌐 https://www.axisdirect.in/contact-us"
-            )
-            hist = state.history + [
-                {"role": "user",      "content": customer_message},
-                {"role": "assistant", "content": deact_msg},
-            ]
-            ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=deact_msg,
-                    quick_reply_options=["Go back to main menu", "End Chat"],
-                    flow_state="session_end_response",
-                    status="ok",
-                ),
-                ns,
-            )
-
-        # Active — show thank you
-        thank_you = "Thank you for using Axis Direct! Is there anything else I can help you with?"
-        hist = state.history + [
-            {"role": "user",      "content": customer_message},
-            {"role": "assistant", "content": thank_you},
-        ]
-        ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=thank_you,
-                quick_reply_options=["Go back to main menu", "End Chat"],
-                flow_state="session_end_response",
-                status="ok",
-            ),
-            ns,
-        )
+        # The buttons shown after trade instructions are "Go back to main menu" /
+        # "End Chat". Honour those via the shared session-end node (robust
+        # word-boundary matching), instead of running an account-status check
+        # that would hijack the customer's navigation choice.
+        return handle_session_end(state, customer_message)
 
     # ── Session end ───────────────────────────────────────────────────────────
     if fs == "session_end_response":

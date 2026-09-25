@@ -200,6 +200,13 @@ def handle_message(
         state = state.model_copy(update={"sub_account_id": sub_account_id})
         save_session(conversation_id, state)
 
+    # ── Fully-agentic mode (AGENTIC_MODE=true) ────────────────────────────────
+    # When enabled, the LLM agent decides which tools to call and in what order.
+    # The deterministic flows below are bypassed. Auth is still enforced: an
+    # account-specific request without a sub_account_id is asked for inline.
+    if os.getenv("AGENTIC_MODE", "false").lower() == "true":
+        return _handle_agentic(state, raw_input, conversation_id)
+
     # ── Global "End Chat" — works from ANY flow state ─────────────────────────
     # A customer can end the conversation at any point (e.g. mid-flow at the FY
     # picker), not only from the session_end node. Scoped to explicit end
@@ -348,7 +355,13 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
 
         messages.append({"role": "user", "content": [{"text": raw_input}]})
 
+        import time as _t
+        _t0 = _t.perf_counter()
         result     = call_intent_llm(_INTENT_SYS, messages)
+        logger.info("[TIMING] intent_classify_ms=%d model=%s in=%d out=%d",
+                    int((_t.perf_counter() - _t0) * 1000),
+                    result.get("model_id", "?"),
+                    result.get("input_tokens", 0), result.get("output_tokens", 0))
         parsed     = result.get("parsed") or {}
 
         # Support both old single-intent {"intent": ...} and new multi-intent {"intents": [...]}
@@ -584,7 +597,11 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
     if intent in all_flows:
         new_state = state.model_copy(update={"flow": intent, "flow_state": "start"})
         save_session(state.conversation_id, new_state)
+        import time as _t
+        _t0 = _t.perf_counter()
         resp, _ = all_flows[intent](new_state, raw_input)
+        logger.info("[TIMING] flow_dispatch_ms=%d flow=%s (API + any flow LLM)",
+                    int((_t.perf_counter() - _t0) * 1000), intent)
         return resp
 
     # ── Greeting — static message + menu (no LLM call) ───────────────────────
@@ -674,6 +691,63 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
         save_session(state.conversation_id, new_state)
         resp, _ = handle_need_more_help(new_state, raw_input)
         return resp
+
+
+def _handle_agentic(state: SessionState, raw_input: str, conversation_id: str) -> InternalMessageResponse:
+    """
+    Fully-agentic turn: the LLM agent decides which tools to call and when.
+    Bypasses the deterministic state machines. Auth is still enforced in code —
+    if an account-specific request has no sub_account_id, we ask for it inline
+    (reusing the same awaiting_sub_account_id mechanism).
+    """
+    from src.core.strands_agent import run_agent_turn
+
+    # Build a context block for the agent (recent history + known account id).
+    recent = state.history[-6:]
+    convo  = "\n".join(
+        f"{'Customer' if h.get('role')=='user' else 'Assistant'}: {h.get('content','')}"
+        for h in recent if h.get("content")
+    )
+    sub_line = (
+        f"Customer Sub-Account ID: {state.sub_account_id}"
+        if state.sub_account_id else
+        "Customer Sub-Account ID: (not provided — if you need it for an account "
+        "action, ask the customer to share their numeric Sub-Account ID)"
+    )
+    prompt = (
+        f"{sub_line}\n\n"
+        f"Conversation so far:\n{convo or '(none)'}\n\n"
+        f"Customer's latest message: {raw_input}\n\n"
+        f"Decide what to do (call tools as needed) and reply to the customer."
+    )
+
+    result   = run_agent_turn(prompt)
+    message  = result.get("message") or "I'm sorry, I couldn't process that. Please try again."
+    escalate = bool(result.get("escalate"))
+
+    hist = state.history + [
+        {"role": "user",      "content": raw_input},
+        {"role": "assistant", "content": message},
+    ]
+    save_session(conversation_id, state.model_copy(update={"history": hist}))
+    logger.info("[ENTRY:agentic] conv=%s escalate=%s reply_len=%d",
+                conversation_id, escalate, len(message))
+
+    if escalate:
+        return InternalMessageResponse(
+            reply_message=message,
+            quick_reply_options=[],
+            flow_state="escalated",
+            status="escalate",
+            eventid="1002",
+        )
+    return InternalMessageResponse(
+        reply_message=message,
+        quick_reply_options=[],
+        flow_state="agentic",
+        status="ok",
+        eventid="1001",
+    )
 
 
 def _auth_required_response() -> InternalMessageResponse:

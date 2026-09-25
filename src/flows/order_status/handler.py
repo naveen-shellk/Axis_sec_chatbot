@@ -153,9 +153,9 @@ def handle_order_status(
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.gateways.customer_api import get_customer_profile
+        from src.core.strands_agent import get_profile
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
         except Exception:
             status = "active"
@@ -292,7 +292,16 @@ def handle_order_status(
         else:
             from src.gateways.order_api import send_order_history_email
             today_str = date.today().strftime("%d-%m-%Y")
-            result = send_order_history_email(state.sub_account_id or "", segment, today_str)
+            result = None
+            try:
+                from src.core.strands_agent import run_tool
+                result = run_tool("send_order_history_email",
+                                  sub_account_id=state.sub_account_id or "",
+                                  segment=segment, date_str=today_str)
+            except Exception as exc:
+                logger.warning("[ORDER_STATUS] agent tool path failed: %s — direct fallback", exc)
+            if result is None:
+                result = send_order_history_email(state.sub_account_id or "", segment, today_str)
             if not result.get("success", False):
                 _err = (
                     "We were unable to send your order book at this time.\n\n"
@@ -344,7 +353,16 @@ def handle_order_status(
             )
 
         from src.gateways.order_api import get_todays_orders
-        order_data   = get_todays_orders(state.sub_account_id or "", segment)
+        # Agent-orchestrated tool call; direct fallback if the agent path fails.
+        order_data = None
+        try:
+            from src.core.strands_agent import run_tool
+            order_data = run_tool("get_todays_orders",
+                                  sub_account_id=state.sub_account_id or "", segment=segment)
+        except Exception as exc:
+            logger.warning("[ORDER_STATUS] agent tool path failed: %s — direct fallback", exc)
+        if order_data is None:
+            order_data = get_todays_orders(state.sub_account_id or "", segment)
 
         if not order_data.get("found", False) and order_data.get("error"):
             # API failed — not just empty results
@@ -410,7 +428,16 @@ def handle_order_status(
             )
 
         from src.gateways.order_api import send_order_history_email
-        result = send_order_history_email(state.sub_account_id or "", segment, selected_date)
+        result = None
+        try:
+            from src.core.strands_agent import run_tool
+            result = run_tool("send_order_history_email",
+                              sub_account_id=state.sub_account_id or "",
+                              segment=segment, date_str=selected_date)
+        except Exception as exc:
+            logger.warning("[ORDER_STATUS] agent tool path failed: %s — direct fallback", exc)
+        if result is None:
+            result = send_order_history_email(state.sub_account_id or "", segment, selected_date)
         if not result.get("success", False):
             _err = (
                 "We were unable to send your order history at this time.\n\n"

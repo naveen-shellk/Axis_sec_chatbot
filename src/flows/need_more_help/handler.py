@@ -341,20 +341,31 @@ def handle_need_more_help(
                 {"role": "user",      "content": customer_message},
                 {"role": "assistant", "content": _LIVE_AGENT_MSG},
             ]
+            # Route the escalation signal THROUGH the Strands agent (agent-
+            # orchestrated). Falls back to the direct eventid if the agent errors.
+            eventid = "1002"
+            try:
+                from src.core.strands_agent import run_tool
+                tool_out = run_tool("escalate_to_agent", reason="Customer requested a live agent")
+                if tool_out and tool_out.get("eventid"):
+                    eventid = tool_out["eventid"]
+            except Exception as exc:
+                logger.warning("[NEED_MORE_HELP] agent escalate failed: %s — using direct 1002", exc)
+
             ns = _save(state.conversation_id, state.model_copy(update={
                 "flow_state": "escalated",
                 "escalate":   True,
                 "history":    hist,
             }))
-            logger.info("[NEED_MORE_HELP] conv=%s → YES → escalating (eventid 1002)",
-                        state.conversation_id)
+            logger.info("[NEED_MORE_HELP] conv=%s → YES → escalating (eventid %s, agent-mediated)",
+                        state.conversation_id, eventid)
             return (
                 InternalMessageResponse(
                     reply_message=_LIVE_AGENT_MSG,
                     quick_reply_options=[],
                     flow_state="escalated",
                     status="escalate",
-                    eventid="1002",
+                    eventid=eventid,
                 ),
                 ns,
             )

@@ -50,6 +50,7 @@ def handle_session_end(
       - "Go back to main menu" → status="route_to_entry", flow reset
       - "End Chat" or unrecognised → status="end", session cleared
     """
+    import re as _re
     msg_lower = customer_message.strip().lower()
 
     go_back_signals = {
@@ -61,7 +62,19 @@ def handle_session_end(
         "thanks", "thank you", "that's all", "thats all",
     }
 
-    if any(s in msg_lower for s in go_back_signals):
+    def _matches(signals: set[str]) -> bool:
+        # Whole-phrase / whole-word match only. Substring matching wrongly fired
+        # on things like "no" inside "know" ("I want to know about trading"),
+        # ending the chat when the customer was starting a new request.
+        for s in signals:
+            if " " in s:
+                if s in msg_lower:            # multi-word phrase — substring is fine
+                    return True
+            elif _re.search(rf"\b{_re.escape(s)}\b", msg_lower):  # single word — word boundary
+                return True
+        return False
+
+    if _matches(go_back_signals):
         new_state = state.model_copy(update={
             "flow": None,
             "flow_state": "main_menu",
@@ -79,7 +92,7 @@ def handle_session_end(
             new_state,
         )
 
-    if any(s in msg_lower for s in end_signals):
+    if _matches(end_signals):
         clear_session(state.conversation_id)
         logger.info("[SESSION_END] conv=%s → end chat", state.conversation_id)
         return (

@@ -75,18 +75,33 @@ def _financial_years() -> list[str]:
     return [f"FY {base-i}-{str(base-i+1)[-2:]}" for i in range(3)]
 
 
+def _clamp_future(d: date) -> date:
+    """Never allow a date in the future — the reports API rejects future
+    end_dates with 400 'end_date cannot be in the future'."""
+    today = date.today()
+    return today if d > today else d
+
+
 def _resolve_dates(label: str) -> tuple[str, str]:
     today = date.today()
     fy = re.match(r"FY\s*(\d{4})-(\d{2})", label, re.IGNORECASE)
     if fy:
         y = int(fy.group(1))
-        return f"01-04-{y}", f"31-03-{y+1}"
+        start = date(y, 4, 1)
+        end   = date(y + 1, 3, 31)
+        # For the current (ongoing) FY, 31-Mar is in the future → clamp to today.
+        end   = _clamp_future(end)
+        return start.strftime("%d-%m-%Y"), end.strftime("%d-%m-%Y")
     iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", label)
     if iso:
-        d = f"{iso.group(3)}-{iso.group(2)}-{iso.group(1)}"
-        return d, d
-    if re.match(r"^\d{2}-\d{2}-\d{4}$", label):
-        return label, label
+        d = _clamp_future(date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))))
+        ds = d.strftime("%d-%m-%Y")
+        return ds, ds
+    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", label)
+    if m:
+        d = _clamp_future(date(int(m.group(3)), int(m.group(2)), int(m.group(1))))
+        ds = d.strftime("%d-%m-%Y")
+        return ds, ds
     s = today - timedelta(days=90)
     return s.strftime("%d-%m-%Y"), today.strftime("%d-%m-%Y")
 
@@ -207,17 +222,41 @@ def _send_and_confirm(
     end_date: str,
     customer_message: str,
 ) -> tuple[InternalMessageResponse, SessionState]:
-    """Call statement API — show confirmation only on success, error message on failure."""
+    """Call statement API (via Strands agent, direct fallback) — confirm on success."""
     from src.gateways.statement_api import request_statement_fireandforget
 
     try:
-        result = request_statement_fireandforget(
-            sub_account_id=state.sub_account_id or "",
-            api_jobname=report["jobname"],
-            endpoint=report["endpoint"],
-            start_date=start_date,
-            end_date=end_date,
-        )
+        # Agent-orchestrated tool call; falls back to the direct gateway call.
+        result = None
+        try:
+            from src.core.strands_agent import run_tool
+            tool_out = run_tool(
+                "request_statement",
+                sub_account_id=state.sub_account_id or "",
+                report_name=report["jobname"],
+                start_date=start_date,
+                end_date=end_date,
+                endpoint=report["endpoint"],
+            )
+            if tool_out is not None:
+                # Adapt the tool dict to the StatementResult-like shape the flow uses.
+                from src.gateways.statement_api import StatementResult
+                result = StatementResult(
+                    success=bool(tool_out.get("success")),
+                    masked_email=tool_out.get("masked_email", "") or "",
+                    error_message=tool_out.get("error") or "",
+                )
+        except Exception as exc:
+            logger.warning("[STATEMENT] agent tool path failed: %s — falling back direct", exc)
+
+        if result is None:
+            result = request_statement_fireandforget(
+                sub_account_id=state.sub_account_id or "",
+                api_jobname=report["jobname"],
+                endpoint=report["endpoint"],
+                start_date=start_date,
+                end_date=end_date,
+            )
     except Exception as exc:
         logger.error("[STATEMENT] API call failed: %s", exc)
         reply = (
@@ -271,9 +310,9 @@ def handle_statement(
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.gateways.customer_api import get_customer_profile
+        from src.core.strands_agent import get_profile
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
         except Exception:
             status = "active"
@@ -507,10 +546,13 @@ def handle_statement(
                 )
 
             m_num    = MONTH_NAMES.index(month_name) + 1
-            last_day = calendar.monthrange(int(year), m_num)[1]
-            start    = f"01-{m_num:02d}-{year}"
-            end      = f"{last_day}-{m_num:02d}-{year}"
-            report   = _get_report(state.collected_data.get("report_name", ""))
+            last_day  = calendar.monthrange(int(year), m_num)[1]
+            start     = f"01-{m_num:02d}-{year}"
+            # Clamp the month-end to today so the current month never sends a
+            # future end_date (the reports API rejects those with 400).
+            end_date  = _clamp_future(date(int(year), m_num, last_day))
+            end       = end_date.strftime("%d-%m-%Y")
+            report    = _get_report(state.collected_data.get("report_name", ""))
             return _send_and_confirm(state, report or {}, start, end, customer_message)
 
     if fs == "session_end_response":

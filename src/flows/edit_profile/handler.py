@@ -70,9 +70,9 @@ def handle_edit_profile(
 
     # ── Account status check after deeplink (post-login only) ─────────────────
     if fs == "account_status_check":
-        from src.gateways.customer_api import get_customer_profile
+        from src.core.strands_agent import get_profile
         try:
-            profile = get_customer_profile(state.sub_account_id or "")
+            profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
         except Exception:
             status = "active"

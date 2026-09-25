@@ -188,6 +188,30 @@ def _msg_changed_mind(name: str) -> str:
 
 # ── Scenario detection ─────────────────────────────────────────────────────────
 
+def _detect_closure_type(text: str) -> str:
+    """
+    Infer which account the customer wants to close from their message.
+    Mirrors the email-automation logic (closure_agent.py) so both channels
+    resolve the same type and send it to create_account_closure.
+
+    Returns one of: 'demat' | 'trading' | 'demat_and_trading'
+    Default when unspecified: 'demat_and_trading' (both) — matches email agent.
+    """
+    t = (text or "").lower()
+    trading_kw = ("trading account", "trading a/c", "close trading", "trading id", "trading")
+    demat_kw   = ("demat", "dp account", "dp a/c")
+    has_trading = any(k in t for k in trading_kw)
+    has_demat   = any(k in t for k in demat_kw)
+
+    if has_trading and has_demat:
+        return "demat_and_trading"
+    if has_trading:
+        return "trading"
+    if has_demat:
+        return "demat"
+    return "demat_and_trading"
+
+
 def _detect_scenario(api_result: dict) -> str:
     """Returns: 'already_closed' | 'in_progress' | 'new_request'"""
     api_resp = api_result.get("api_response", {})
@@ -246,8 +270,23 @@ def _call_closure_api(
     dp_account_no: str = "",
 ) -> dict:
     from src.gateways.gateway_client import create_closure_request
-    logger.info("[CLOSURE] Calling Gateway create_closure_request sub=%s type=%s",
+    logger.info("[CLOSURE] create_account_closure (agent-mediated) sub=%s type=%s",
                 sub_account_id, closure_type)
+    # Route through the Strands agent; fall back to the direct gateway call.
+    try:
+        from src.core.strands_agent import run_tool
+        out = run_tool(
+            "create_account_closure",
+            sub_account_id=sub_account_id,
+            email=email,
+            name=name,
+            type_of_account_closure=closure_type,
+            dp_account_no=dp_account_no,
+        )
+        if out is not None:
+            return out
+    except Exception as exc:
+        logger.warning("[CLOSURE] agent tool path failed: %s — direct fallback", exc)
     try:
         return create_closure_request(
             sub_account_id,
@@ -284,8 +323,8 @@ def handle_closure(
 
         if sub_id:
             try:
-                from src.gateways.customer_api import get_customer_profile
-                profile = get_customer_profile(sub_id)
+                from src.core.strands_agent import get_profile
+                profile = get_profile(sub_id)
                 name    = profile.name or sub_id
                 demat   = profile.demat_account_no or sub_id
                 trading = profile.trading_account_no or sub_id
@@ -294,7 +333,12 @@ def handle_closure(
                 logger.warning("[CLOSURE] profile fetch failed: %s", exc)
                 name = sub_id
 
-        api_result = _call_closure_api(sub_id, email, name)
+        # Infer the account type the customer wants to close from their message
+        # (e.g. "close my trading account" → trading). Mirrors email automation.
+        closure_type = _detect_closure_type(customer_message)
+        logger.info("[CLOSURE] conv=%s detected closure_type=%s", state.conversation_id, closure_type)
+
+        api_result = _call_closure_api(sub_id, email, name, closure_type=closure_type)
         scenario   = _detect_scenario(api_result)
 
         logger.info("[CLOSURE] conv=%s sub=%s scenario=%s",
@@ -302,6 +346,7 @@ def handle_closure(
 
         collected = {
             **state.collected_data,
+            "closure_type": closure_type,
             "name":    name,
             "demat":   demat,
             "trading": trading,
@@ -420,27 +465,28 @@ def handle_closure(
                 ns,
             )
 
-        # Customer confirms they still want to proceed → ask closure type first
+        # Customer confirms they still want to proceed → go straight to the
+        # closure guidance (Message 2). Per the provided flow spec, the bot does
+        # NOT ask which account type to close — the customer completes the actual
+        # closure themselves via the portal / offline process.
         if _wants_to_proceed(customer_message):
-            _TYPE_ASK_MSG = (
-                "Understood. Before I proceed, please let me know which account you'd like to close:"
-            )
+            msg2 = _msg_new_request_2()
             hist = state.history + [
                 {"role": "user",      "content": customer_message},
-                {"role": "assistant", "content": _TYPE_ASK_MSG},
+                {"role": "assistant", "content": msg2},
             ]
             ns = state.model_copy(update={
-                "flow_state": "closure_type_selection",
+                "flow_state": "new_request_msg3",
                 "history":    hist,
             })
             save_session(state.conversation_id, ns)
-            logger.info("[CLOSURE] conv=%s → confirmed, asking closure type",
+            logger.info("[CLOSURE] conv=%s → confirmed, sending Message 2 (deeplink)",
                         state.conversation_id)
             return (
                 InternalMessageResponse(
-                    reply_message=_TYPE_ASK_MSG,
-                    quick_reply_options=["Demat Account", "Trading Account", "Both"],
-                    flow_state="closure_type_selection",
+                    reply_message=msg2,
+                    quick_reply_options=["Continue", "Go back to main menu"],
+                    flow_state="new_request_msg3",
                     status="ok",
                 ),
                 ns,
@@ -463,63 +509,6 @@ def handle_closure(
                 quick_reply_options=["I still want to close my account", "Go back to main menu"],
                 flow_state="confirm_proceed",
                 status="reprompt",
-            ),
-            ns,
-        )
-
-    # ── CLOSURE TYPE SELECTION ────────────────────────────────────────────────
-    if fs == "closure_type_selection":
-        msg_lower = customer_message.strip().lower()
-
-        # Detect which type the customer selected
-        if any(w in msg_lower for w in ("both", "demat and trading", "demat & trading", "all")):
-            closure_type = "demat and trading"
-            display_type = "Demat & Trading Account"
-        elif any(w in msg_lower for w in ("trading", "trade")):
-            closure_type = "trading"
-            display_type = "Trading Account"
-        elif any(w in msg_lower for w in ("demat", "dp", "both", "demat account")):
-            closure_type = "demat"
-            display_type = "Demat Account"
-        else:
-            # Ambiguous — re-ask
-            re_ask = "Please select which account you'd like to close:"
-            hist = state.history + [
-                {"role": "user",      "content": customer_message},
-                {"role": "assistant", "content": re_ask},
-            ]
-            ns = state.model_copy(update={"history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=re_ask,
-                    quick_reply_options=["Demat Account", "Trading Account", "Both"],
-                    flow_state="closure_type_selection",
-                    status="reprompt",
-                ),
-                ns,
-            )
-
-        # Store closure type and send Message 2
-        msg2 = _msg_new_request_2()
-        hist = state.history + [
-            {"role": "user",      "content": customer_message},
-            {"role": "assistant", "content": msg2},
-        ]
-        ns = state.model_copy(update={
-            "flow_state": "new_request_msg3",
-            "history":    hist,
-            "collected_data": {**state.collected_data, "closure_type": closure_type},
-        })
-        save_session(state.conversation_id, ns)
-        logger.info("[CLOSURE] conv=%s → closure_type=%r, sending Message 2 (deeplink)",
-                    state.conversation_id, closure_type)
-        return (
-            InternalMessageResponse(
-                reply_message=msg2,
-                quick_reply_options=["Continue", "Go back to main menu"],
-                flow_state="new_request_msg3",
-                status="ok",
             ),
             ns,
         )

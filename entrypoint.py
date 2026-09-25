@@ -77,6 +77,19 @@ _RESPONSE_MODEL = os.getenv("RESPONSE_MODEL_ID",  "qwen.qwen3-235b-a22b-2507-v1:
 # ── BedrockAgentCoreApp ───────────────────────────────────────────────────────
 app = BedrockAgentCoreApp()
 
+# Warm the AgentCore Memory clients at container startup so the first customer
+# request doesn't pay the ~1-2s boto3 client-init cost.
+try:
+    from src.core.session_store import warmup as _warmup_memory
+    _warmup_memory()
+except Exception as _exc:
+    _log.warning("memory warmup skipped: %s", _exc)
+try:
+    from src.core.strands_agent import warmup as _warmup_agent
+    _warmup_agent()
+except Exception as _exc:
+    _log.warning("agent warmup skipped: %s", _exc)
+
 
 def _generate_escalation_summary(session, conversation_id: str, last_message: str) -> str:
     """

@@ -1,0 +1,18 @@
+# config/.env is the single config file — baked into the image intentionally.
+config/.env.example
+
+# Unnecessary files
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+logs/
+*.log
+.git/
+.gitignore
+deploy_agentcore.ps1
+_create_runtime.py
+_validate.ps1
+test_runtime.py
+test_questions.txt
+README.md

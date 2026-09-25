@@ -1,0 +1,282 @@
+ASL Chatbot Web — Test Questions & Payloads
+============================================
+Base URL  : http://localhost:8000/api/chat
+Auth      : Authorization: Bearer dev-token-change-in-prod
+Sub-ID    : Replace 6033593 with your actual test sub-account ID
+Keep same Conversationid within a multi-turn flow.
+Change Conversationid for each new flow test.
+
+
+════════════════════════════════════════════
+1. NO-AUTH FLOWS (no sub_account_id needed)
+════════════════════════════════════════════
+
+── Bank Query ──────────────────────────────
+{"Conversationid":"t-bq-01","Message":"Bank Query","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Axis Bank care numbers + website + branch locator
+
+── Edit Profile ────────────────────────────
+{"Conversationid":"t-ep-01","Message":"Edit Profile","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Login portal deeplink with editable fields list
+
+── Greeting (Haiku response) ───────────────
+{"Conversationid":"t-gr-01","Message":"hi","Event":"Incoming message","Channel":"WEB","timestamp":""}
+{"Conversationid":"t-gr-02","Message":"Good morning","Event":"Incoming message","Channel":"WEB","timestamp":""}
+{"Conversationid":"t-gr-03","Message":"hello there","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Warm greeting + 10 menu buttons (Haiku only, no Qwen call)
+
+── How To Trade — full multi-turn ──────────
+Turn 1: {"Conversationid":"t-htt","Message":"How To Trade","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-htt","Message":"Cash & ETF","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-htt","Message":"BUY","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-htt","Message":"Traders App","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Step-by-step BUY instructions for Cash & ETF on Traders App
+
+── How To Trade — Derivatives ──────────────
+Turn 1: {"Conversationid":"t-htt-d","Message":"How To Trade","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-htt-d","Message":"Derivatives","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-htt-d","Message":"Futures","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-htt-d","Message":"Swift Trade","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Futures instructions on Swift Trade
+
+
+════════════════════════════════════════════════════════
+2. REQUIRES-LOGIN FLOWS (embed sub_account_id in message)
+════════════════════════════════════════════════════════
+
+── Account Details ──────────────────────────
+{"Conversationid":"t-ad-01","Message":"Account Details 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Trading ID, DP ID, demat number, masked email/mobile, bank, nominee
+
+── IPO ──────────────────────────────────────
+{"Conversationid":"t-ipo-01","Message":"IPO 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Personalised message with IPO deeplink (simplehai.axisdirect.in/ipos)
+
+── Login Query — Active Account ─────────────
+{"Conversationid":"t-lq-01","Message":"I can't login 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected (if FTL done): Troubleshooting links
+Expected (if FTL pending): FTL activation steps
+Expected (if deactivated + self-service code): Specific action link
+Expected (if deactivated + escalate code): Connect to live agent (eventid 1002)
+
+── Statement — Tax Reports ──────────────────
+Turn 1: {"Conversationid":"t-st-tx","Message":"Statement 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-st-tx","Message":"Tax Reports","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-st-tx","Message":"Tax Statement","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-st-tx","Message":"FY 2025-26","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Tax Statement sent to your registered email"
+
+── Statement — P&L ──────────────────────────
+Turn 1: {"Conversationid":"t-st-pl","Message":"I want my P&L statement 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-st-pl","Message":"Tax Reports","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-st-pl","Message":"P&L Statement","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-st-pl","Message":"FY 2024-25","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "P&L Statement sent to your registered email"
+
+── Statement — DP Holdings (as-on-date) ─────
+Turn 1: {"Conversationid":"t-st-dp","Message":"Statement 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-st-dp","Message":"Demat Reports","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-st-dp","Message":"DP Holdings","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-st-dp","Message":"<today's date shown as quick reply>","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "DP Holdings sent to your registered email"
+
+── Statement — Contract Notes (month picker) ─
+Turn 1: {"Conversationid":"t-st-cn","Message":"Statement 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-st-cn","Message":"Trading Reports","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-st-cn","Message":"Contract Notes","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-st-cn","Message":"2026","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 5: {"Conversationid":"t-st-cn","Message":"August","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Contract Notes sent to your registered email"
+
+── Brokerage — Trading Charges ──────────────
+Turn 1: {"Conversationid":"t-br-tc","Message":"Brokerage and Charges 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-br-tc","Message":"Trading Charges","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Opening/closing ledger balance
+
+── Brokerage — DP Charges ───────────────────
+Turn 1: {"Conversationid":"t-br-dp","Message":"Brokerage and Charges 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-br-dp","Message":"DP Charges","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-br-dp","Message":"<select a date from quick replies>","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "DP charges statement sent to your registered email"
+
+── Order Status — Today (all orders) ────────
+Turn 1: {"Conversationid":"t-os-td","Message":"Order Status 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-os-td","Message":"Equity","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-os-td","Message":"Today Order Status","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-os-td","Message":"No","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Order book sent to your registered email"
+
+── Order Status — Today (specific scrip) ────
+Turn 1: {"Conversationid":"t-os-sc","Message":"Order Status 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-os-sc","Message":"Equity","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-os-sc","Message":"Today Order Status","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-os-sc","Message":"Yes","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 5: {"Conversationid":"t-os-sc","Message":"RELIANCE","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Order details for RELIANCE or "no orders found"
+
+── Order Status — History ────────────────────
+Turn 1: {"Conversationid":"t-os-hs","Message":"Order Status 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-os-hs","Message":"Equity","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 3: {"Conversationid":"t-os-hs","Message":"Order History","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 4: {"Conversationid":"t-os-hs","Message":"<select a date from quick replies>","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Order history sent to your registered email"
+
+
+════════════════════════════════════════════
+3. NEED MORE HELP — ESCALATION FLOWS
+════════════════════════════════════════════
+
+── Within business hours → escalate ─────────
+Turn 1: {"Conversationid":"t-nmh-y","Message":"Need More Help","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-nmh-y","Message":"Yes","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: eventid 1002 with conversation summary → WxCC
+
+── Within business hours → no ───────────────
+Turn 1: {"Conversationid":"t-nmh-n","Message":"Need More Help","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-nmh-n","Message":"No","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "No problem! Thank you for reaching out" + menu buttons
+
+── Out of hours (set _BIZ_START=23 in handler) ─
+{"Conversationid":"t-nmh-oo","Message":"Need More Help","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Ticket deeplink + "Go back to main menu" / "End Chat" buttons
+
+
+════════════════════════════════════════════
+4. INTENT CLASSIFICATION TESTS
+════════════════════════════════════════════
+
+── escalate_to_human — complex Axis query ───
+{"Conversationid":"t-esc","Message":"My account was fraudulently accessed and funds were withdrawn without my knowledge","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Direct eventid 1002 (within hours) or ticket link (out of hours)
+
+── unknown → escalation flow ────────────────
+{"Conversationid":"t-unk","Message":"I need help with something urgent about my account","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Haiku classifies as unknown → confirmation prompt "Would you like to connect to a live agent?"
+
+── Free text intent detection ───────────────
+{"Conversationid":"t-frt-1","Message":"I want to check my taxes","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Classified as statement intent → asks for sub_account_id
+
+{"Conversationid":"t-frt-2","Message":"How do I place an intraday order","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Classified as how_to_trade
+
+{"Conversationid":"t-frt-3","Message":"I forgot my password","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Classified as login_query → asks for sub_account_id
+
+── Multi-intent ─────────────────────────────
+{"Conversationid":"t-mi-1","Message":"I want my tax statement and also check my account details 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Starts statement flow with note that account_details is pending
+
+{"Conversationid":"t-mi-2","Message":"Bank Query and also edit my profile","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Combined response — bank contact info + portal deeplink
+
+
+════════════════════════════════════════════
+5. AUTH & SESSION TESTS
+════════════════════════════════════════════
+
+── No sub_account_id → bot asks inline ──────
+{"Conversationid":"t-noauth","Message":"Statement","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Please share your Sub-Account ID (e.g. 7032318)"
+
+Turn 2: {"Conversationid":"t-noauth","Message":"6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Resumes statement flow
+
+── ID embedded in message ───────────────────
+{"Conversationid":"t-emb","Message":"I want to check my account details, my id is 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Haiku extracts 6033593, goes straight to account details
+
+── Invalid/missing auth token ───────────────
+curl -X POST http://localhost:8000/api/chat -H "Authorization: Bearer wrong-token" -H "Content-Type: application/json" -d '{"Conversationid":"t-auth","Message":"hi","Event":"Incoming message","Channel":"WEB","timestamp":""}'
+Expected: HTTP 401 Unauthorized
+
+── Session expiry (TTL test) ────────────────
+1. Send a message → get response
+2. Wait 15+ minutes (or temporarily set SESSION_TTL_SECONDS=30 in .env)
+3. Send another message on same Conversationid
+Expected: Fresh session — history and flow reset
+
+── End Chat ─────────────────────────────────
+Turn 1: {"Conversationid":"t-end","Message":"Bank Query","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-end","Message":"End Chat","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Thank you for reaching out to Axis Direct! Have a great day." — session cleared
+
+── Go back to main menu ─────────────────────
+Turn 1: {"Conversationid":"t-menu","Message":"Bank Query","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-menu","Message":"Go back to main menu","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Taking you back to the main menu" + 4 pre-login menu buttons
+
+
+════════════════════════════════════════════
+6. ERROR HANDLING TESTS
+════════════════════════════════════════════
+
+── API failure — wrong CUSTOMER_PROFILE_URL ─
+1. Set CUSTOMER_PROFILE_URL=https://invalid.url in config/.env
+2. Restart server
+3. Send: {"Conversationid":"t-err","Message":"Account Details 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "We were unable to retrieve your account details at this time. Please try again later"
+
+── Deactivated account ───────────────────────
+{"Conversationid":"t-deact","Message":"Statement <deactivated_sub_id>","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Your account is currently deactivated. Please contact support"
+
+
+════════════════════════════════════════════
+7. OAUTH2 TOKEN ENDPOINT TEST
+════════════════════════════════════════════
+
+── Get token ────────────────────────────────
+curl -X POST http://localhost:8000/oauth/token \
+  -H "Authorization: Basic d3hjX2FzbF9jaGF0Ym90OmRldi1zZWNyZXQtY2hhbmdlLWluLXByb2Q=" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials"
+
+(Basic auth above = base64 of "wxc_asl_chatbot:dev-secret-change-in-prod")
+Expected: { "access_token": "dev-token-change-in-prod", "token_type": "Bearer", "expires_in": 3600 }
+
+── Invalid credentials ──────────────────────
+curl -X POST http://localhost:8000/oauth/token \
+  -H "Authorization: Basic d3Jvbmc6Y3JlZGVudGlhbHM=" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials"
+Expected: HTTP 401 { "error": "invalid_client" }
+
+
+════════════════════════════════════════════
+8. CLOSURE FLOW TEST (intent-only)
+════════════════════════════════════════════
+
+Turn 1: {"Conversationid":"t-cl","Message":"I want to close my account 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Qwen generates empathetic "sorry to see you go" message
+         Quick replies: ["I still want to close my account", "Go back to main menu"]
+
+Turn 2: {"Conversationid":"t-cl","Message":"I still want to close my account","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Which account do you want to close?"
+         Quick replies: ["Demat Account", "Trading Account", "Both"]
+
+Turn 3: {"Conversationid":"t-cl","Message":"Demat Account","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: Portal deeplink + REQUEST ACCOUNT CLOSURE tab instructions
+
+Turn 4 (Continue): {"Conversationid":"t-cl","Message":"Continue","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: NRI/offline form details (CDSL/NSDL download paths)
+
+Turn 5: {"Conversationid":"t-cl","Message":"Main Menu","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "Thank you! Please click below on the Main Menu tab"
+
+── Closure — changed mind ────────────────────
+Turn 1: {"Conversationid":"t-cl-no","Message":"close my account 6033593","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Turn 2: {"Conversationid":"t-cl-no","Message":"Go back to main menu","Event":"Incoming message","Channel":"WEB","timestamp":""}
+Expected: "That's great to hear! We're glad you've decided to stay"
+
+
+════════════════════════════════════════════
+NOTES
+════════════════════════════════════════════
+- Replace 6033593 with your actual test sub-account ID
+- Server: cd chatbot_web && python app.py  (runs on port 8000)
+- Swagger UI: http://localhost:8000/docs
+- Logs: chatbot_web/logs/log.txt
+- Session TTL: 900s (15 min) — configurable via SESSION_TTL_SECONDS in config/.env
+- Gateway: disabled by default (ENABLE_AGENTCORE_GATEWAY=false) — all calls use direct HTTP
+- Environment: ENVIRONMENT=local_test — enables direct HTTP fallback

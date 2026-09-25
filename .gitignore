@@ -1,0 +1,24 @@
+# ── Secrets — NEVER commit ──────────────────────────────
+config/.env
+config/.env.runtime
+.env
+.env.local
+*.pem
+*.key
+
+# ── Logs (contain conversation data / PII) ──────────────
+logs/
+*.log
+
+# ── Python generated ────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ── OS / editor junk ────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

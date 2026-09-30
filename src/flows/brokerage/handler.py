@@ -31,9 +31,26 @@ _DP_CHARGES_LINK = "https://www.axisdirect.in/charges"
 CHARGES_TYPES    = ["Trading Charges", "DP Charges"]
 
 
+import re
+
+
 def _last_30_days() -> list[str]:
     today = date.today()
     return [(today - timedelta(days=i)).strftime("%d-%m-%Y") for i in range(1, 31)]
+
+
+def _parse_range(text: str) -> tuple[date, date] | None:
+    """Extract two DD-MM-YYYY dates (start, end) from the calendar picker's
+    'DD-MM-YYYY to DD-MM-YYYY' post, or from free text."""
+    dates = re.findall(r"\b(\d{2})[-/](\d{2})[-/](\d{4})\b", text or "")
+    if len(dates) >= 2:
+        try:
+            d1 = date(int(dates[0][2]), int(dates[0][1]), int(dates[0][0]))
+            d2 = date(int(dates[1][2]), int(dates[1][1]), int(dates[1][0]))
+            return (d1, d2) if d1 <= d2 else (d2, d1)
+        except ValueError:
+            return None
+    return None
 
 
 # ── Hardcoded messages ────────────────────────────────────────────────────────
@@ -59,7 +76,11 @@ def _msg_trading_charges(closing: str, opening: str, masked_email: str) -> str:
     )
 
 def _msg_dp_date() -> str:
-    return "Please select the date for your DP charges statement:"
+    return ("Please select a date range within 30 days from the calendar "
+            "(DD-MM-YYYY to DD-MM-YYYY) for your DP charges statement.")
+
+def _msg_dp_range_wrong() -> str:
+    return "Please choose a date range within the last 30 days."
 
 def _msg_dp_sent(masked_email: str) -> str:
     return (
@@ -107,9 +128,9 @@ def _match(text: str, options: list[str]) -> str | None:
     for opt in options:
         if opt.lower() == tl:
             return opt
-    for opt in options:
-        if opt.lower() in tl or tl in opt.lower():
-            return opt
+    # EXACT match only. Non-exact (typed/free-text) input is left for the LLM
+    # (Haiku) extractor / agentic decision — no substring guessing, per the rule
+    # "exact predefined match → programmatic; everything else → Haiku".
     return None
 
 
@@ -131,7 +152,7 @@ def handle_brokerage(
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.core.strands_agent import get_profile
+        from src.core.langchain_agent import get_profile
         try:
             profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
@@ -169,13 +190,39 @@ def handle_brokerage(
 
     # ── CHARGES TYPE SELECTION ────────────────────────────────────────────────
     if fs == "charges_type_selection":
-        # 1. Exact/partial match
+        # 1. Exact/partial match (button tap)
         charges_type = _match(customer_message, CHARGES_TYPES)
 
         # 2. LLM extraction for free text
         if not charges_type:
             parsed       = _extract(_EXTRACT_CHARGES_SYS, customer_message)
             charges_type = _match(parsed.get("selected", ""), CHARGES_TYPES)
+
+        # 3. AGENTIC API DECISION — this is a genuine MULTI-API choice point:
+        #    "Trading Charges" → ledger API, "DP Charges" → DP bill API. When the
+        #    customer's free text is ambiguous and steps 1-2 couldn't resolve it,
+        #    let the agent pick which API path to take. (Deterministic fallback:
+        #    the first candidate if the agent can't decide.)
+        if not charges_type:
+            try:
+                from src.core.langchain_agent import run_api_decision
+                decision = run_api_decision(
+                    flow="charges",
+                    request_summary=customer_message,
+                    candidates=[
+                        {"id": "Trading Charges",
+                         "when": "brokerage / trading / ledger balance / outstanding "
+                                 "amount / why was I debited / account balance charges"},
+                        {"id": "DP Charges",
+                         "when": "demat / DP / AMC / annual maintenance / depository "
+                                 "charges / demat account charges bill"},
+                    ],
+                )
+                charges_type = _match(decision.get("choice", ""), CHARGES_TYPES)
+                if charges_type:
+                    logger.info("[BROKERAGE] agentic API decision → %s", charges_type)
+            except Exception as exc:
+                logger.warning("[BROKERAGE] agentic API decision failed: %s", exc)
 
         if not charges_type:
             reply = _msg_reprompt()
@@ -196,7 +243,7 @@ def handle_brokerage(
             today_str = date.today().strftime("%d-%m-%Y")
             ledger    = None
             try:
-                from src.core.strands_agent import run_tool
+                from src.core.langchain_agent import run_tool
                 ledger = run_tool("get_ledger_balance",
                                   sub_account_id=state.sub_account_id or "",
                                   start_date=today_str, end_date=today_str)
@@ -224,7 +271,7 @@ def handle_brokerage(
                 )
 
             try:
-                from src.core.strands_agent import get_profile
+                from src.core.langchain_agent import get_profile
                 profile = get_profile(state.sub_account_id or "")
                 masked  = mask_email(profile.registered_email) or "your registered email"
             except Exception:
@@ -248,8 +295,7 @@ def handle_brokerage(
                 ), ns,
             )
 
-        # ── DP Charges: show date picker ──────────────────────────────────────
-        dates = _last_30_days()[:10]
+        # ── DP Charges: 30-day calendar range picker (UI keys off flow_state) ──
         reply = _msg_dp_date()
         ns = state.model_copy(update={
             "flow_state": "dp_date_selection",
@@ -258,53 +304,65 @@ def handle_brokerage(
         save_session(state.conversation_id, ns)
         return (
             InternalMessageResponse(
-                reply_message=reply, quick_reply_options=dates,
+                reply_message=reply, quick_reply_options=[],
                 flow_state="dp_date_selection", status="ok",
             ), ns,
         )
 
-    # ── DP DATE SELECTION ─────────────────────────────────────────────────────
+    # ── DP DATE SELECTION (30-day calendar range) ─────────────────────────────
     if fs == "dp_date_selection":
-        dates = _last_30_days()[:10]
-
-        # 1. Exact match
-        selected_date = _match(customer_message, dates)
-
-        # 2. LLM extraction
-        if not selected_date:
-            parsed        = _extract(_EXTRACT_DATE_SYS, customer_message, {"dates": ", ".join(dates)})
-            selected_date = _match(parsed.get("selected", ""), dates) or parsed.get("selected")
-
-        if not selected_date:
-            reply = _msg_reprompt()
+        rng = _parse_range(customer_message)
+        if not rng:
+            reply = _msg_dp_date()
             ns = state.model_copy(update={"history": _hist(state, customer_message, reply)})
             save_session(state.conversation_id, ns)
             return (
                 InternalMessageResponse(
-                    reply_message=reply, quick_reply_options=dates,
+                    reply_message=reply, quick_reply_options=[],
                     flow_state="dp_date_selection", status="reprompt",
                 ), ns,
             )
+        d1, d2 = rng
+        if (d2 - d1).days > 30 or d2 > date.today():
+            reply = _msg_dp_range_wrong()
+            ns = state.model_copy(update={"history": _hist(state, customer_message, reply)})
+            save_session(state.conversation_id, ns)
+            return (
+                InternalMessageResponse(
+                    reply_message=reply, quick_reply_options=[],
+                    flow_state="dp_date_selection", status="reprompt",
+                ), ns,
+            )
+        start_date = d1.strftime("%d-%m-%Y")
+        end_date   = d2.strftime("%d-%m-%Y")
 
         from src.gateways.statement_api import send_dp_bill
         from src.gateways.customer_api import get_customer_profile, mask_email
 
         result = None
         try:
-            from src.core.strands_agent import run_tool
+            from src.core.langchain_agent import run_tool
             result = run_tool("send_dp_bill",
                               sub_account_id=state.sub_account_id or "",
-                              start_date=selected_date, end_date=selected_date)
+                              start_date=start_date, end_date=end_date)
         except Exception as exc:
             logger.warning("[BROKERAGE] agent tool path failed: %s — direct fallback", exc)
         if result is None:
-            result = send_dp_bill(state.sub_account_id or "", selected_date, selected_date)
+            result = send_dp_bill(state.sub_account_id or "", start_date, end_date)
 
         if not result.get("success", False):
-            _err = (
-                "We were unable to send your DP charges statement at this time.\n\n"
-                "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
-            )
+            # "No documents found" for the period is a data condition, not an
+            # outage — show a clear no-data message instead of a system error.
+            if result.get("no_data"):
+                _err = ("No DP charges statement was found for the selected date "
+                        "range. Please try a different period.")
+                _status = "ok"
+            else:
+                _err = (
+                    "We were unable to send your DP charges statement at this time.\n\n"
+                    "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
+                )
+                _status = "error"
             ns = state.model_copy(update={
                 "flow_state": "session_end_response",
                 "history": _hist(state, customer_message, _err),
@@ -314,12 +372,12 @@ def handle_brokerage(
                 InternalMessageResponse(
                     reply_message=_err,
                     quick_reply_options=["Go back to main menu", "End Chat"],
-                    flow_state="session_end_response", status="error",
+                    flow_state="session_end_response", status=_status,
                 ), ns,
             )
 
         try:
-            from src.core.strands_agent import get_profile
+            from src.core.langchain_agent import get_profile
             profile = get_profile(state.sub_account_id or "")
             masked  = mask_email(profile.registered_email) or "your registered email"
         except Exception:

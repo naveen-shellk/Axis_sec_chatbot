@@ -55,7 +55,9 @@ def get_customer_profile(sub_account_id: str) -> CustomerProfile:
     portal_status  = 1 if device_list else 0
     deact_code     = str(raw.get("entStatusLov") or raw.get("deactivationCode") or "").strip().upper()
     opening_date   = raw.get("accountOpeningDate") or raw.get("openingDate") or ""
-    phone          = str(raw.get("mobileNo") or raw.get("phone") or "")
+    # The profile API returns the mobile under "phoneNo" (as an int); older
+    # shapes used "mobileNo"/"phone". Accept any of them and stringify.
+    phone          = str(raw.get("mobileNo") or raw.get("phoneNo") or raw.get("phone") or "").strip()
 
     # Extract primary demat account number from dpAccountDetails
     dp_accounts    = raw.get("dpAccountDetails") or []
@@ -85,9 +87,19 @@ def get_customer_profile(sub_account_id: str) -> CustomerProfile:
 
 
 def mask_account(account_no: str) -> str:
-    if not account_no or len(account_no) < 4:
-        return account_no or ""
-    return f"XXXXXXXXXXX{account_no[-4:]}"
+    """Mask a bank / demat / trading account number, showing only the last 4."""
+    s = str(account_no or "").strip()
+    if not s or len(s) < 4:
+        return s
+    return f"{'X' * (len(s) - 4)}{s[-4:]}"
+
+
+def mask_pan(pan: str) -> str:
+    """Mask a PAN — show first 2 and last 1 char (e.g. AB*****1F → AB******F)."""
+    s = str(pan or "").strip().upper()
+    if not s or len(s) < 4:
+        return s
+    return f"{s[:2]}{'*' * (len(s) - 3)}{s[-1]}"
 
 
 __all__ = [
@@ -96,5 +108,6 @@ __all__ = [
     "mask_email",
     "mask_mobile",
     "mask_account",
+    "mask_pan",
     "get_masked_email",
 ]

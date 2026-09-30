@@ -206,48 +206,85 @@ _AC_SENTINEL = "__CLEARED__"
 _AC_ACTOR_ID = "web-chatbot-anonymous"   # all pre-login sessions share this actor
 
 
+# Memory-credential strategy:
+#   Default (recommended): use the container's own IAM execution role via IMDS —
+#   it never expires, so memory keeps working indefinitely. The runtime role
+#   (AslWebChatbotRuntimeRole) already has AgentCoreMemoryAccess on memory/*.
+#
+#   Legacy/cross-account: set USE_IAM_ROLE_FOR_MEMORY=false to force the static
+#   MEMORY_AWS_* STS credentials (which EXPIRE — the cause of memory dropping out
+#   after a few hours). Only needed if memory lives in a different account than
+#   the runtime and the role can't reach it.
+_USE_IAM_ROLE_FOR_MEMORY = os.getenv("USE_IAM_ROLE_FOR_MEMORY", "true").lower() == "true"
+
+
 def _get_ac_clients():
     """Return (data_client, control_client), creating them once.
-    
-    AgentCore Memory lives in the SANDBOX account — use dedicated
-    MEMORY_AWS_* credentials if set, otherwise fall back to default env creds.
+
+    Prefers the IAM execution role (default credential chain → IMDS in the
+    deployed container) so credentials never expire. Falls back to static
+    MEMORY_AWS_* only when USE_IAM_ROLE_FOR_MEMORY=false.
     """
     global _ac_data_client, _ac_control_client
     with _ac_lock:
         if _ac_data_client is None:
             import boto3
 
-            # Memory resource is in sandbox account — may need separate creds
-            # from the Bedrock model credentials (which may be in a different account).
             mem_key    = os.getenv("MEMORY_AWS_ACCESS_KEY_ID")
             mem_secret = os.getenv("MEMORY_AWS_SECRET_ACCESS_KEY")
             mem_token  = os.getenv("MEMORY_AWS_SESSION_TOKEN")
 
-            kwargs = {"region_name": AWS_REGION}
-            if mem_key and mem_secret:
+            if not _USE_IAM_ROLE_FOR_MEMORY and mem_key and mem_secret:
+                # Legacy static-credential path (expires — avoid in production).
                 boto_sess = boto3.Session(
                     region_name=AWS_REGION,
                     aws_access_key_id=mem_key,
                     aws_secret_access_key=mem_secret,
                     aws_session_token=mem_token,
                 )
-                logger.info("[SESSION:agentcore] Using dedicated MEMORY_AWS_* credentials")
+                logger.info("[SESSION:agentcore] Using static MEMORY_AWS_* credentials (USE_IAM_ROLE_FOR_MEMORY=false)")
             else:
+                # Default: IAM execution role for memory.
+                #
+                # IMPORTANT: the container has AWS_ACCESS_KEY_ID / SECRET /
+                # SESSION_TOKEN baked into config/.env for the MODEL account
+                # (625867133907, used by Bedrock). boto3's default credential
+                # chain would pick THOSE env creds up first — so memory calls
+                # would go out as the model account, where the memory resource
+                # (in the runtime account 106611079163) does not exist →
+                # "Memory not found: ResourceNotFoundException".
+                #
+                # To reach the memory, we must resolve to the RUNTIME execution
+                # role. We build a botocore session whose credential resolver has
+                # the *environment* provider removed, so it falls through to the
+                # container/instance role provider that AgentCore injects.
+                import botocore.session as _bc_session
+
+                _bs = _bc_session.get_session()
                 try:
-                    import botocore.session
-                    bc_sess = botocore.session.get_session()
-                    resolver = bc_sess.get_component("credential_provider")
-                    resolver.providers = [p for p in resolver.providers if p.METHOD != "env"]
-                    boto_sess = boto3.Session(botocore_session=bc_sess, region_name=AWS_REGION)
-                    if boto_sess.get_credentials() is None:
-                        boto_sess = boto3.Session(region_name=AWS_REGION)
-                except Exception:
-                    boto_sess = boto3.Session(region_name=AWS_REGION)
+                    _resolver = _bs.get_component("credential_provider")
+                    _resolver.remove("env")
+                    logger.info("[SESSION:agentcore] Using IAM execution role "
+                                "(env credential provider removed → runtime role)")
+                except Exception as _e:
+                    logger.warning("[SESSION:agentcore] could not remove env cred "
+                                   "provider (%s) — falling back to default chain", _e)
+                boto_sess = boto3.Session(botocore_session=_bs, region_name=AWS_REGION)
 
             _ac_data_client    = boto_sess.client("bedrock-agentcore")
             _ac_control_client = boto_sess.client("bedrock-agentcore-control")
             logger.info("[SESSION:agentcore] Clients initialised region=%s memory_id=%s",
                         AWS_REGION, AGENTCORE_MEMORY_ID)
+            # DIAGNOSTIC: log the effective caller identity so we can confirm
+            # WHICH account/principal the container actually calls AgentCore as.
+            # "Memory not found" despite a valid resource usually means the
+            # container is operating as a principal in a DIFFERENT account.
+            try:
+                _ident = boto_sess.client("sts").get_caller_identity()
+                logger.info("[SESSION:agentcore] CALLER_IDENTITY account=%s arn=%s",
+                            _ident.get("Account"), _ident.get("Arn"))
+            except Exception as _e:
+                logger.warning("[SESSION:agentcore] caller-identity check failed: %s", _e)
     return _ac_data_client, _ac_control_client
 
 

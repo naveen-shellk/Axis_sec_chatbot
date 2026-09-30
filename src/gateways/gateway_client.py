@@ -52,6 +52,32 @@ def _blocked(api_name: str) -> dict:
 
 logger = logging.getLogger(__name__)
 
+# ── Tools proxy (ngrok) ───────────────────────────────────────────────────────
+# When TOOLS_PROXY_URL is set, tool calls go DIRECTLY to the ngrok-tunnelled
+# tools proxy (runtime → ngrok → proxy → internal API), bypassing both the
+# AgentCore Gateway and the raw internal-IP direct calls. This lets the deployed
+# container reach internal APIs it otherwise can't route to.
+_TOOLS_PROXY_URL = os.getenv("TOOLS_PROXY_URL", "").rstrip("/")
+_TOOLS_PROXY_KEY = os.getenv("TOOLS_PROXY_KEY", "")
+
+
+def _proxy_enabled() -> bool:
+    return bool(_TOOLS_PROXY_URL)
+
+
+def _proxy_call(endpoint: str, body: dict) -> dict:
+    """POST to the tools proxy endpoint (e.g. '/get_customer_profile')."""
+    import json as _json
+    url = f"{_TOOLS_PROXY_URL}/{endpoint.lstrip('/')}"
+    headers = {"Content-Type": "application/json", "ngrok-skip-browser-warning": "1"}
+    if _TOOLS_PROXY_KEY:
+        headers["X-Proxy-Key"] = _TOOLS_PROXY_KEY
+    logger.info("[PROXY] POST %s", url)
+    resp = _requests.post(url, json=body, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
 # ── Direct HTTP base URLs (read from env, same as email automation) ───────────
 _CUSTOMER_PROFILE_URL  = os.getenv("CUSTOMER_PROFILE_URL",
                                    "https://cust-pvt-api.uat.asldt.in/customer-profile/details")
@@ -65,6 +91,84 @@ _CLOSURE_URL           = os.getenv("ILEVERAGE_CLOSURE_URL",
                                    "https://connapi-preprod.axissl.in/api/create_account_closure/v2")
 _LEDGER_URL            = os.getenv("LEDGER_URL",
                                    "https://reports-api.uat.asldt.in/inquiry/get-ledger")
+
+# ── Reports API Basic Auth (same creds as the email automation) ───────────────
+_ILEVERAGE_USERNAME = os.getenv("ILEVERAGE_USERNAME", "")
+_ILEVERAGE_PASSWORD = os.getenv("ILEVERAGE_PASSWORD", "")
+_REPORTS_API_BASE   = "https://reports-api.uat.asldt.in"
+
+# ── Report routing (ported verbatim from the working email automation) ────────
+# Maps a report jobname/type → (endpoint_suffix, canonical_reportname).
+# Two endpoints only:
+#   "exports"              → oneclick reports (subAccountId/reportName, ISO dates)
+#   "statements/send-mail" → comtrack fire-and-forget (customerId/jobname, DD-MM dates)
+# The API emails the report to the customer's registered address.
+_REPORT_ROUTING: dict[str, tuple[str, str]] = {
+    # comtrack send-mail (fire-and-forget)
+    "cml (nsdl)":                       ("statements/send-mail", "CDSLCML,NSDLCML"),
+    "cdslcml,nsdlcml":                  ("statements/send-mail", "CDSLCML,NSDLCML"),
+    "nsdlcml":                          ("statements/send-mail", "NSDLCML"),
+    "cdslcml":                          ("statements/send-mail", "CDSLCML"),
+    "contract note":                    ("statements/send-mail", "CommonContractNotes"),
+    "contract notes":                   ("statements/send-mail", "CommonContractNotes"),
+    "commoncontractnotes":              ("statements/send-mail", "CommonContractNotes"),
+    "dp transaction statement":         ("statements/send-mail", "DP"),
+    "dp":                               ("statements/send-mail", "DP"),
+    "agts":                             ("statements/send-mail", "AGTS"),
+    "global statement (agts)":          ("statements/send-mail", "AGTS"),
+    "commodity contract note":          ("statements/send-mail", "CommodityContractNotes"),
+    "commodity daily margin":           ("statements/send-mail", "CommodityDailyMargin"),
+    "bill":                             ("statements/send-mail", "Bill"),
+    "equity margin":                    ("statements/send-mail", "EquityMargin"),
+    "equitymargin":                     ("statements/send-mail", "EquityMargin"),
+    "commodity contract note physical": ("statements/send-mail", "CommodityContractNotesPhysical"),
+    "derivative physical bill":         ("statements/send-mail", "DerivativePhysicalBills"),
+    "retention statement":              ("statements/send-mail", "RetentionStatement"),
+    "retentionstatement":               ("statements/send-mail", "RetentionStatement"),
+    "soacumros":                        ("statements/send-mail", "SOAcumROS"),
+    "slbm contract notes":              ("statements/send-mail", "SLBMContractNotes"),
+    "slbmcontractnotes":                ("statements/send-mail", "SLBMContractNotes"),
+    # Exact jobname keys the statement flow passes (so routing is 1:1, no guess)
+    "commoncontractnotes":              ("statements/send-mail", "CommonContractNotes"),
+    "commoditycontractnotes":           ("statements/send-mail", "CommodityContractNotes"),
+    "commoditycontractnotesphysical":   ("statements/send-mail", "CommodityContractNotesPhysical"),
+    "derivativephysicalbills":          ("statements/send-mail", "DerivativePhysicalBills"),
+    "commoditydailymargin":             ("statements/send-mail", "CommodityDailyMargin"),
+    # exports (API emails the report). Names below are the ONLY ones the live
+    # UAT Reports API /exports accepts (verified 2026-09): Ledger Statement,
+    # Tax Statement, Portfolio Holding Statement, Pan-Level Transaction
+    # Statement, Trade Book Statement. All other names return 400 "invalid
+    # report name".
+    "tax statement":                    ("exports", "Tax Statement"),
+    "p&l statement":                    ("exports", "Portfolio Holding Statement"),
+    "portfolio holding statement":      ("exports", "Portfolio Holding Statement"),
+    "ledger report":                    ("exports", "Ledger Statement"),
+    "ledger statement":                 ("exports", "Ledger Statement"),
+    "account statement":                ("exports", "Ledger Statement"),
+    "pan level transaction report":     ("exports", "Pan-Level Transaction Statement"),
+    "pan-level transaction statement":  ("exports", "Pan-Level Transaction Statement"),
+    "trade book statement":             ("exports", "Trade Book Statement"),
+    # DP Holdings exports name — email automation uses "DP Holding Statement".
+    "dp holdings":                      ("exports", "DP Holding Statement"),
+    "dp holding statement":             ("exports", "DP Holding Statement"),
+}
+
+
+def _resolve_report_routing(report_name: str, endpoint_hint: str = "") -> tuple[str, str]:
+    """
+    Return (endpoint_suffix, canonical_reportname) for a report.
+    Uses the routing table (exact then partial match); if the report isn't found,
+    falls back to the caller's endpoint hint ("exports"/"sendmail") and the name
+    as-is. Mirrors the email automation's resolve_report_routing.
+    """
+    key = (report_name or "").lower().strip()
+    if key in _REPORT_ROUTING:
+        return _REPORT_ROUTING[key]
+    for k, v in _REPORT_ROUTING.items():
+        if key and (key in k or k in key):
+            return v
+    suffix = "statements/send-mail" if endpoint_hint == "sendmail" else "exports"
+    return (suffix, report_name)
 
 
 def _is_vpc_error(raw: Any) -> bool:
@@ -136,10 +240,16 @@ def _to_iso(date_str: str) -> str:
 
 def get_customer_profile(sub_account_id: str) -> dict[str, Any]:
     """
-    Gateway first → direct HTTP fallback.
+    Tools proxy (if TOOLS_PROXY_URL set) → Gateway → direct HTTP fallback.
     Returns raw profile dict (data envelope unwrapped).
     """
     logger.info("[GW] get_customer_profile sub=%s", sub_account_id)
+
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/get_customer_profile", {"sub_account_id": sub_account_id})
+        except Exception as exc:
+            logger.warning("[PROXY] get_customer_profile failed: %s — trying gateway/direct", exc)
 
     # ── Try Gateway ───────────────────────────────────────────────────────────
     try:
@@ -194,9 +304,27 @@ def request_statement(
     endpoint:       str = "exports",   # "exports" | "sendmail" | "oneclick"
     dp_account_no:  str = "",
 ) -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback."""
+    """Tools proxy → Gateway → direct HTTP fallback."""
     logger.info("[GW] request_statement sub=%s report=%s endpoint=%s",
                 sub_account_id, report_name, endpoint)
+
+    # ── Tools proxy (ngrok) — same path as every other tool ───────────────────
+    # When TOOLS_PROXY_URL is set (deployed runtime / local client), route the
+    # statement request through the proxy so it reaches the internal Reports API.
+    # On the proxy host itself TOOLS_PROXY_URL is empty, so it falls through to
+    # the gateway/direct call below (no recursion).
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/request_statement", {
+                "sub_account_id": sub_account_id,
+                "report_name":    report_name,
+                "start_date":     start_date,
+                "end_date":       end_date,
+                "endpoint":       endpoint,
+                "dp_account_no":  dp_account_no,
+            })
+        except Exception as exc:
+            logger.warning("[PROXY] request_statement failed: %s — trying gateway/direct", exc)
 
     # ── Try Gateway ───────────────────────────────────────────────────────────
     try:
@@ -261,51 +389,69 @@ def _request_statement_direct(sub_account_id, report_name, start_date, end_date,
                                 endpoint, dp_account_no) -> dict:
     """Direct HTTP to reports-api.uat.asldt.in"""
     try:
+        endpoint_suffix, canonical_name = _resolve_report_routing(report_name, endpoint)
+
         headers = {
             "Content-Type":    "application/json",
-            "X-SubAccountID":  sub_account_id,
+            "X-SubAccountId":  sub_account_id,
             "X-Source":        "ChatBot",
             "X-SourceChannel": "Web",
         }
-        if endpoint == "exports":
-            url     = f"https://reports-api.uat.asldt.in/exports"
+
+        # send-mail reports (and DP holdings on exports) need the DP account
+        # number. Resolve it from the customer profile when not supplied — the
+        # API requires dpId for CML, DP transaction, SOAcumROS, etc.
+        if not dp_account_no and (endpoint_suffix == "statements/send-mail"
+                                   or "dp" in canonical_name.lower()):
+            try:
+                from src.gateways.customer_api import get_customer_profile as _cp
+                dp_account_no = _cp(sub_account_id).demat_account_no or ""
+                logger.info("[GW] request_statement resolved dp account from profile: %s",
+                            dp_account_no or "(none)")
+            except Exception as exc:
+                logger.warning("[GW] request_statement could not resolve dp account: %s", exc)
+
+        if endpoint_suffix == "statements/send-mail":
+            # send-mail expects all camelCase: customerId/dpId/startDate/endDate/
+            # requestType + jobname; dates DD-MM-YYYY. (Confirmed against the live
+            # UAT Reports API — the DP-account field must be "dpId", not "dp_id".)
+            url = f"{_REPORTS_API_BASE}/statements/send-mail"
+            payload = {
+                "customerId":  sub_account_id,
+                "dpId":        dp_account_no,
+                "startDate":   start_date,          # DD-MM-YYYY
+                "endDate":     end_date,
+                "jobname":     canonical_name,
+                "requestType": "email",
+            }
+        else:  # exports (oneclick)
+            url = f"{_REPORTS_API_BASE}/exports"
             payload = {
                 "subAccountId":     sub_account_id,
-                "reportName":       report_name,
-                "startDate":        _to_iso(start_date),
+                "reportName":       canonical_name,
+                "startDate":        _to_iso(start_date),   # YYYY-MM-DD
                 "endDate":          _to_iso(end_date),
                 "fileType":         "xlsx",
-                "downloadTypeFlag": "E",
-                "source":           "chat-bot",
                 "dpaccountno":      dp_account_no,
                 "holdingType":      "All",
-            }
-        elif endpoint == "sendmail":
-            url     = f"https://reports-api.uat.asldt.in/statements/send-mail"
-            payload = {
-                "customer_id":  sub_account_id,
-                "dp_id":        dp_account_no,
-                "start_date":   start_date,
-                "end_date":     end_date,
-                "jobname":      report_name,
-                "request_type": "email",
-            }
-        else:  # oneclick
-            url     = f"https://reports-api.uat.asldt.in/oneclick/statements/request-statement"
-            payload = {
-                "customer_id":  sub_account_id,
-                "dp_id":        dp_account_no,
-                "start_date":   start_date,
-                "end_date":     end_date,
-                "jobname":      report_name,
-                "request_type": "email",
+                "downloadTypeFlag": "D",
+                "source":           "chat-bot",
             }
 
-        resp = _requests.post(url, json=payload, headers=headers, timeout=60)
+        auth = None
+        if _ILEVERAGE_USERNAME and _ILEVERAGE_PASSWORD:
+            auth = (_ILEVERAGE_USERNAME, _ILEVERAGE_PASSWORD)
+        else:
+            logger.warning("[GW] request_statement: ILEVERAGE creds missing — Basic Auth skipped")
+
+        logger.info("[GW] request_statement direct → %s report=%s", url, canonical_name)
+        resp = _requests.post(url, json=payload, headers=headers, auth=auth, timeout=60)
         logger.info("[GW] request_statement direct HTTP status=%d", resp.status_code)
         if resp.status_code in (200, 201):
             return resp.json()
-        return {"error": f"HTTP {resp.status_code}"}
+        logger.error("[GW] request_statement direct failed: HTTP %d | %s",
+                     resp.status_code, resp.text[:300])
+        return {"error": f"HTTP {resp.status_code}", "detail": resp.text[:300]}
     except Exception as e:
         logger.error("[GW] request_statement direct HTTP failed: %s", e)
         return {"error": str(e)}
@@ -317,8 +463,16 @@ def _request_statement_direct(sub_account_id, report_name, start_date, end_date,
 # =============================================================================
 
 def get_ledger(sub_account_id: str, start_date: str, end_date: str) -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback."""
+    """Tools proxy → Gateway → direct HTTP fallback."""
     logger.info("[GW] get_ledger sub=%s %s→%s", sub_account_id, start_date, end_date)
+
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/get_ledger_balance",
+                               {"sub_account_id": sub_account_id,
+                                "start_date": start_date, "end_date": end_date})
+        except Exception as exc:
+            logger.warning("[PROXY] get_ledger failed: %s — trying gateway/direct", exc)
 
     # ── Try Gateway ───────────────────────────────────────────────────────────
     try:
@@ -378,43 +532,51 @@ def _get_ledger_direct(sub_account_id: str, start_date: str, end_date: str) -> d
 
 def send_dp_bill(sub_account_id: str, start_date: str, end_date: str,
                  dp_id: str = "") -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback. Uses comtrack/sendmail route."""
+    """Tools proxy → Gateway → direct HTTP fallback. Uses comtrack/sendmail route."""
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/send_dp_bill",
+                               {"sub_account_id": sub_account_id,
+                                "start_date": start_date, "end_date": end_date})
+        except Exception as exc:
+            logger.warning("[PROXY] send_dp_bill failed: %s — trying gateway/direct", exc)
     logger.info("[GW] send_dp_bill sub=%s", sub_account_id)
     masked = get_masked_email(sub_account_id)
 
-    try:
-        raw = call_tool("statement-api-v2___request_statement_comtrack", {
-            "X-SubAccountId": sub_account_id,
-            "customer_id":    sub_account_id,
-            "dp_id":          dp_id,
-            "start_date":     start_date,
-            "end_date":       end_date,
-            "jobname":        "Bill",
-            "request_type":   "email",
-        })
-        if not _is_vpc_error(raw):
-            return {"success": True, "masked_email": masked}
-        logger.warning("[GW] send_dp_bill Gateway VPC error — falling back")
-    except (MCPGatewayError, Exception) as e:
-        logger.warning("[GW] send_dp_bill Gateway error — falling back: %s", e)
-
-    # Direct HTTP (local_test only)
-    if not _direct_allowed():
-        return _blocked("send_dp_bill")
-    try:
-        resp = _requests.post(
-            "https://reports-api.uat.asldt.in/statements/send-mail",
-            json={"customer_id": sub_account_id, "dp_id": dp_id,
-                  "start_date": start_date, "end_date": end_date,
-                  "jobname": "Bill", "request_type": "email"},
-            headers={"Content-Type": "application/json"},
-            timeout=30,
+    # NOTE: The legacy snake_case send-mail payload ({customer_id, dp_id,
+    # start_date, ...} with no X-SubAccountId header / no Basic auth) is
+    # REJECTED by the live UAT Reports API with 400 "sub account id is missing".
+    # Route the DP bill through the same working send-mail contract every other
+    # statement uses: _request_statement_direct resolves "Bill" → send-mail,
+    # adds the X-SubAccountId header, camelCase payload (customerId/dpId/
+    # startDate/endDate/jobname/requestType), resolves dpId, and Basic auth.
+    if _direct_allowed():
+        resp = _request_statement_direct(
+            sub_account_id=sub_account_id,
+            report_name="Bill",
+            start_date=start_date,      # DD-MM-YYYY
+            end_date=end_date,
+            endpoint="sendmail",
+            dp_account_no=dp_id,
         )
-        success = resp.status_code in (200, 201)
-        return {"success": success, "masked_email": masked}
-    except Exception as e:
-        logger.error("[GW] send_dp_bill direct HTTP failed: %s", e)
-        return {"success": False, "masked_email": masked, "error": str(e)}
+    else:
+        resp = request_statement(
+            sub_account_id=sub_account_id,
+            report_name="Bill",
+            start_date=start_date,
+            end_date=end_date,
+            endpoint="sendmail",
+            dp_account_no=dp_id,
+        )
+
+    # A dict without "error" means the bill was dispatched. "No documents"/502
+    # is a data condition (no bill for that period) → success=False + no_data.
+    if isinstance(resp, dict) and "error" in resp:
+        err = str(resp.get("detail") or resp.get("error") or "").lower()
+        no_data = "no documents" in err or "not found" in err
+        return {"success": False, "masked_email": masked,
+                "no_data": no_data, "error": resp.get("error")}
+    return {"success": True, "masked_email": masked}
 
 
 # =============================================================================
@@ -474,7 +636,13 @@ def _call_trade_book_direct(sub_account_id: str, segment: str) -> dict:
 
 
 def get_todays_orders(sub_account_id: str, segment_label: str) -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback."""
+    """Tools proxy → Gateway → direct HTTP fallback."""
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/get_todays_orders",
+                               {"sub_account_id": sub_account_id, "segment": segment_label})
+        except Exception as exc:
+            logger.warning("[PROXY] get_todays_orders failed: %s — trying gateway/direct", exc)
     segment = _SEGMENT_MAP.get(segment_label, "EQ")
     logger.info("[GW] get_todays_orders sub=%s segment=%s", sub_account_id, segment)
 
@@ -497,26 +665,61 @@ def get_todays_orders(sub_account_id: str, segment_label: str) -> dict[str, Any]
 
 
 def send_order_history_email(sub_account_id: str, segment_label: str,
-                              date_str: str) -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback. Fetches trade book data."""
-    segment = _SEGMENT_MAP.get(segment_label, "EQ")
-    masked  = get_masked_email(sub_account_id)
-    logger.info("[GW] send_order_history_email sub=%s segment=%s date=%s",
-                sub_account_id, segment, date_str)
+                              date_str: str, end_date: str = "") -> dict[str, Any]:
+    """
+    Order history → Trade Book Statement (aligned with the email automation).
 
-    success = False
-    try:
-        raw = _call_trade_book_gateway(sub_account_id, segment)
-        if not _is_vpc_error(raw):
-            success = True
-        else:
-            raw = _call_trade_book_direct(sub_account_id, segment)
-            success = raw.get("success", False)
-    except (MCPGatewayError, Exception):
-        raw = _call_trade_book_direct(sub_account_id, segment)
-        success = raw.get("success", False)
+    The email automation's order_history_agent fetches order history via the
+    Reports API "Trade Book Statement" on /exports for a date range (emailed to
+    the customer), NOT the live intraday get-trade-book endpoint. We mirror that:
+    request the "Trade Book Statement" report for the selected range. When
+    end_date is omitted, date_str is used as both start and end (single day).
+    """
+    end = end_date or date_str
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/send_order_history_email",
+                               {"sub_account_id": sub_account_id,
+                                "segment": segment_label,
+                                "date_str": date_str, "end_date": end})
+        except Exception as exc:
+            logger.warning("[PROXY] send_order_history_email failed: %s — trying gateway/direct", exc)
 
-    return {"success": success, "masked_email": masked}
+    masked = get_masked_email(sub_account_id)
+    logger.info("[GW] send_order_history_email sub=%s segment=%s %s→%s → Trade Book Statement",
+                sub_account_id, segment_label, date_str, end)
+
+    # local_test runs with the gateway disabled → go straight to direct HTTP
+    # (/exports). _request_statement_direct converts DD-MM-YYYY → YYYY-MM-DD and
+    # resolves "Trade Book Statement" via the routing table.
+    if _direct_allowed():
+        resp = _request_statement_direct(
+            sub_account_id=sub_account_id,
+            report_name="Trade Book Statement",
+            start_date=date_str,      # DD-MM-YYYY
+            end_date=end,
+            endpoint="exports",
+            dp_account_no="",
+        )
+    else:
+        # Deployed runtime: go through the standard proxy/gateway wrapper.
+        resp = request_statement(
+            sub_account_id=sub_account_id,
+            report_name="Trade Book Statement",
+            start_date=date_str,
+            end_date=end,
+            endpoint="exports",
+        )
+
+    # A dict without "error" means the report was dispatched (emailed).
+    # An explicit error (incl. "no documents") → success=False; the flow shows
+    # the appropriate message and offers the fallback contact.
+    if isinstance(resp, dict) and "error" in resp:
+        err = str(resp.get("detail") or resp.get("error") or "").lower()
+        no_data = "no documents" in err or "not found" in err
+        return {"success": False, "masked_email": masked,
+                "no_data": no_data, "error": resp.get("error")}
+    return {"success": True, "masked_email": masked}
 
 
 # =============================================================================
@@ -529,8 +732,17 @@ def send_order_history_email(sub_account_id: str, segment_label: str,
 def create_closure_request(sub_account_id: str, email: str, name: str,
                             type_of_account_closure: str = "demat",
                             dp_account_no: str = "") -> dict[str, Any]:
-    """Gateway first → direct HTTP fallback (internal IP — requires VPC)."""
+    """Tools proxy → Gateway → direct HTTP fallback (internal IP — requires VPC)."""
     logger.info("[GW] create_closure_request sub=%s type=%s", sub_account_id, type_of_account_closure)
+
+    if _proxy_enabled():
+        try:
+            return _proxy_call("/create_account_closure",
+                               {"sub_account_id": sub_account_id, "email": email, "name": name,
+                                "type_of_account_closure": type_of_account_closure,
+                                "dp_account_no": dp_account_no})
+        except Exception as exc:
+            logger.warning("[PROXY] create_closure_request failed: %s — trying gateway/direct", exc)
 
     try:
         payload_gw = {

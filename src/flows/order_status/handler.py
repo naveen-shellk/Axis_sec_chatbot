@@ -31,9 +31,26 @@ SEGMENTS    = ["Equity", "Commodity", "Derivatives", "Mutual Funds"]
 ORDER_TYPES = ["Today Order Status", "Order History"]
 
 
+import re
+
+
 def _last_30_days() -> list[str]:
     today = date.today()
     return [(today - timedelta(days=i)).strftime("%d-%m-%Y") for i in range(1, 31)]
+
+
+def _parse_range(text: str) -> tuple[date, date] | None:
+    """Extract two DD-MM-YYYY dates (start, end) from the calendar picker's
+    'DD-MM-YYYY to DD-MM-YYYY' post, or from free text."""
+    dates = re.findall(r"\b(\d{2})[-/](\d{2})[-/](\d{4})\b", text or "")
+    if len(dates) >= 2:
+        try:
+            d1 = date(int(dates[0][2]), int(dates[0][1]), int(dates[0][0]))
+            d2 = date(int(dates[1][2]), int(dates[1][1]), int(dates[1][0]))
+            return (d1, d2) if d1 <= d2 else (d2, d1)
+        except ValueError:
+            return None
+    return None
 
 
 # ── Hardcoded messages ────────────────────────────────────────────────────────
@@ -68,7 +85,11 @@ def _msg_history_sent() -> str:
     return "We have sent you the order book for the selected period on your registered E-mail ID."
 
 def _msg_date_picker() -> str:
-    return "Please select the date for order history (last 30 days):"
+    return ("Please select a date range within 30 days from the calendar "
+            "(DD-MM-YYYY to DD-MM-YYYY) for your order history.")
+
+def _msg_range_wrong() -> str:
+    return "Please choose a date range within the last 30 days."
 
 def _msg_deactivated() -> str:
     return (
@@ -129,9 +150,9 @@ def _match(text: str, options: list[str]) -> str | None:
     for opt in options:
         if opt.lower() == tl:
             return opt
-    for opt in options:
-        if opt.lower() in tl or tl in opt.lower():
-            return opt
+    # EXACT match only. Non-exact (typed/free-text) input is left for the LLM
+    # (Haiku) extractor — no substring guessing, per the routing rule
+    # "exact predefined match → programmatic; everything else → Haiku".
     return None
 
 
@@ -153,7 +174,7 @@ def handle_order_status(
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.core.strands_agent import get_profile
+        from src.core.langchain_agent import get_profile
         try:
             profile = get_profile(state.sub_account_id or "")
             status  = profile.account_status
@@ -255,7 +276,7 @@ def handle_order_status(
                 ), ns,
             )
         else:
-            dates = _last_30_days()[:10]
+            # 30-day calendar range picker (UI keys off flow_state, no chips).
             reply = _msg_date_picker()
             ns = state.model_copy(update={
                 "flow_state": "order_date_selection",
@@ -265,7 +286,7 @@ def handle_order_status(
             save_session(state.conversation_id, ns)
             return (
                 InternalMessageResponse(
-                    reply_message=reply, quick_reply_options=dates,
+                    reply_message=reply, quick_reply_options=[],
                     flow_state="order_date_selection", status="ok",
                 ), ns,
             )
@@ -294,7 +315,7 @@ def handle_order_status(
             today_str = date.today().strftime("%d-%m-%Y")
             result = None
             try:
-                from src.core.strands_agent import run_tool
+                from src.core.langchain_agent import run_tool
                 result = run_tool("send_order_history_email",
                                   sub_account_id=state.sub_account_id or "",
                                   segment=segment, date_str=today_str)
@@ -356,7 +377,7 @@ def handle_order_status(
         # Agent-orchestrated tool call; direct fallback if the agent path fails.
         order_data = None
         try:
-            from src.core.strands_agent import run_tool
+            from src.core.langchain_agent import run_tool
             order_data = run_tool("get_todays_orders",
                                   sub_account_id=state.sub_account_id or "", segment=segment)
         except Exception as exc:
@@ -405,44 +426,57 @@ def handle_order_status(
             ), ns,
         )
 
-    # ── ORDER HISTORY: date ───────────────────────────────────────────────────
+    # ── ORDER HISTORY: 30-day calendar range ──────────────────────────────────
     if fs == "order_date_selection":
         segment = state.collected_data.get("segment", "Equity")
-        dates   = _last_30_days()[:10]
 
-        # Exact match first
-        selected_date = _match(customer_message, dates)
-        if not selected_date:
-            parsed        = _extract(_EXTRACT_DATE_SYS, customer_message, {"dates": ", ".join(dates)})
-            selected_date = _match(parsed.get("selected", ""), dates) or parsed.get("selected")
-
-        if not selected_date:
-            reply = _msg_reprompt(dates)
+        rng = _parse_range(customer_message)
+        if not rng:
+            reply = _msg_date_picker()
             ns = state.model_copy(update={"history": _hist(state, customer_message, reply)})
             save_session(state.conversation_id, ns)
             return (
                 InternalMessageResponse(
-                    reply_message=reply, quick_reply_options=dates,
+                    reply_message=reply, quick_reply_options=[],
                     flow_state="order_date_selection", status="reprompt",
                 ), ns,
             )
+        d1, d2 = rng
+        if (d2 - d1).days > 30 or d2 > date.today():
+            reply = _msg_range_wrong()
+            ns = state.model_copy(update={"history": _hist(state, customer_message, reply)})
+            save_session(state.conversation_id, ns)
+            return (
+                InternalMessageResponse(
+                    reply_message=reply, quick_reply_options=[],
+                    flow_state="order_date_selection", status="reprompt",
+                ), ns,
+            )
+        start_date = d1.strftime("%d-%m-%Y")
+        end_date   = d2.strftime("%d-%m-%Y")
 
         from src.gateways.order_api import send_order_history_email
         result = None
         try:
-            from src.core.strands_agent import run_tool
+            from src.core.langchain_agent import run_tool
             result = run_tool("send_order_history_email",
                               sub_account_id=state.sub_account_id or "",
-                              segment=segment, date_str=selected_date)
+                              segment=segment, date_str=start_date, end_date=end_date)
         except Exception as exc:
             logger.warning("[ORDER_STATUS] agent tool path failed: %s — direct fallback", exc)
         if result is None:
-            result = send_order_history_email(state.sub_account_id or "", segment, selected_date)
+            result = send_order_history_email(state.sub_account_id or "", segment, start_date, end_date)
         if not result.get("success", False):
-            _err = (
-                "We were unable to send your order history at this time.\n\n"
-                "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
-            )
+            if result.get("no_data"):
+                _err = ("No order history was found for the selected date range. "
+                        "Please try a different period.")
+                _status = "ok"
+            else:
+                _err = (
+                    "We were unable to send your order history at this time.\n\n"
+                    "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
+                )
+                _status = "error"
             ns = state.model_copy(update={
                 "flow_state": "session_end_response",
                 "history": _hist(state, customer_message, _err),
@@ -452,7 +486,7 @@ def handle_order_status(
                 InternalMessageResponse(
                     reply_message=_err,
                     quick_reply_options=["Go back to main menu", "End Chat"],
-                    flow_state="session_end_response", status="error",
+                    flow_state="session_end_response", status=_status,
                 ), ns,
             )
         reply = _msg_history_sent()

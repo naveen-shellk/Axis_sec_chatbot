@@ -85,7 +85,7 @@ try:
 except Exception as _exc:
     _log.warning("memory warmup skipped: %s", _exc)
 try:
-    from src.core.strands_agent import warmup as _warmup_agent
+    from src.core.langchain_agent import warmup as _warmup_agent
     _warmup_agent()
 except Exception as _exc:
     _log.warning("agent warmup skipped: %s", _exc)

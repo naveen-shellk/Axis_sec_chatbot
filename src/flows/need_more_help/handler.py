@@ -284,6 +284,30 @@ def handle_need_more_help(
             state.conversation_id, elapsed_s, no_response_count,
         )
 
+        # ── NEW QUERY takes priority over timeout ─────────────────────────────
+        # If the customer typed a substantive message that is NOT a yes/no answer
+        # to the connect-prompt, they've moved on to a new question. Re-route it
+        # to the entry classifier instead of re-prompting or timing out. (Only a
+        # blank message or a bare yes/no continues the confirm logic below.)
+        _msg = customer_message.strip()
+        if _msg and not _is_yes(customer_message) and not _is_no(customer_message):
+            logger.info("[NEED_MORE_HELP] conv=%s confirm_agent new query → re-route to classifier",
+                        state.conversation_id)
+            ns = _save(state.conversation_id, state.model_copy(update={
+                "flow": None, "flow_state": "main_menu",
+                "collected_data": {
+                    k: v for k, v in state.collected_data.items()
+                    if k not in ("confirm_sent_at", "no_response_count")
+                },
+            }))
+            return (
+                InternalMessageResponse(
+                    reply_message="", quick_reply_options=[],
+                    flow_state="main_menu", status="route_to_entry",
+                ),
+                ns,
+            )
+
         # ── Timeout: first miss (>60s, count=0) ──────────────────────────────
         if elapsed_s >= _TIMEOUT_SECS and no_response_count == 0:
             now_ts = time.time()
@@ -345,7 +369,7 @@ def handle_need_more_help(
             # orchestrated). Falls back to the direct eventid if the agent errors.
             eventid = "1002"
             try:
-                from src.core.strands_agent import run_tool
+                from src.core.langchain_agent import run_tool
                 tool_out = run_tool("escalate_to_agent", reason="Customer requested a live agent")
                 if tool_out and tool_out.get("eventid"):
                     eventid = tool_out["eventid"]
@@ -393,19 +417,41 @@ def handle_need_more_help(
                 ns,
             )
 
-        # ── Ambiguous → re-ask ────────────────────────────────────────────────
-        hist = state.history + [
-            {"role": "user",      "content": customer_message},
-            {"role": "assistant", "content": _CONFIRM_MSG},
-        ]
-        ns = _save(state.conversation_id, state.model_copy(update={"history": hist}))
+        # ── Neither Yes nor No → the customer likely asked a NEW question ─────
+        # instead of answering the connect-to-agent prompt (e.g. "someone asked
+        # my OTP", "show my statement"). Don't keep re-asking Yes/No — hand the
+        # turn back to the entry router to RE-CLASSIFY the new message. (The
+        # router will show the menu for gibberish, or route to the right flow.)
+        # Only treat truly empty input as a no-op re-ask.
+        if not customer_message.strip():
+            ns = _save(state.conversation_id, state.model_copy(update={"history": state.history}))
+            return (
+                InternalMessageResponse(
+                    reply_message=_CONFIRM_MSG,
+                    quick_reply_options=["Yes", "No"],
+                    flow_state="confirm_agent",
+                    status="reprompt",
+                    eventid="1001",
+                ),
+                ns,
+            )
+
+        logger.info("[NEED_MORE_HELP] conv=%s confirm_agent got a new query → re-route to classifier",
+                    state.conversation_id)
+        # Clear the need_more_help flow so the entry router re-classifies fresh.
+        ns = _save(state.conversation_id, state.model_copy(update={
+            "flow": None, "flow_state": "main_menu",
+            "collected_data": {
+                k: v for k, v in state.collected_data.items()
+                if k not in ("confirm_sent_at", "no_response_count")
+            },
+        }))
         return (
             InternalMessageResponse(
-                reply_message=_CONFIRM_MSG,
-                quick_reply_options=["Yes", "No"],
-                flow_state="confirm_agent",
-                status="reprompt",
-                eventid="1001",
+                reply_message="",              # empty → entry handler re-classifies
+                quick_reply_options=[],
+                flow_state="main_menu",
+                status="route_to_entry",
             ),
             ns,
         )

@@ -112,6 +112,34 @@
   }
   .quick-replies button:hover { background: var(--accent); color: #fff; }
 
+  /* Inline calendar range picker (shown for date-range flow states) */
+  .date-picker {
+    align-self: flex-start;
+    background: #fff;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 90%;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+  }
+  .date-picker .row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+  .date-picker label { color: var(--muted); font-weight: 600; width: 42px; }
+  .date-picker input[type="date"] {
+    flex: 1; padding: 6px 8px; border: 1px solid var(--border);
+    border-radius: 6px; font-size: 13px; color: var(--text);
+  }
+  .date-picker .single .row label { width: auto; }
+  .date-picker button {
+    border: none; background: var(--accent); color: #fff;
+    border-radius: 8px; padding: 8px 12px; font-size: 13px;
+    font-weight: 600; cursor: pointer; margin-top: 4px;
+  }
+  .date-picker button:hover { background: #7b1030; }
+  .date-picker .hint { font-size: 11px; color: var(--muted); }
+
   .typing { align-self: flex-start; color: var(--muted); font-size: 13px; padding: 6px 10px; }
 
   footer {
@@ -143,18 +171,30 @@
 </style>
 </head>
 <body>
+
 <div class="app">
   <header>
     <div class="avatar">AD</div>
     <div>
       <div class="title">Axis Direct Assistant</div>
-      <div class="sub">Local test UI · POST /api/chat</div>
+      <div class="sub">Local FastAPI · /api/chat</div>
+    </div>
+    <!-- ── Top-right app-access lock control ──────────────────────────────── -->
+    <div id="lockBox" style="margin-left:auto;display:flex;align-items:center;gap:6px;">
+      <input id="lockPwd" type="password" placeholder="Password"
+        style="width:120px;padding:6px 9px;border:none;border-radius:7px;font-size:0.8rem;
+               box-sizing:border-box;outline:none;" autocomplete="off" />
+      <button id="lockBtn"
+        style="padding:6px 12px;border:none;border-radius:7px;background:#fff;color:#7b1030;
+               font-size:0.8rem;font-weight:700;cursor:pointer;">
+        Unlock
+      </button>
+      <span id="lockOk" style="display:none;color:#c8f7d4;font-size:1rem;font-weight:700;">✓</span>
     </div>
   </header>
+  <div id="lockErr" style="display:none;color:#c0143c;font-size:0.76rem;padding:4px 16px 0;"></div>
 
   <div class="config">
-    <label>Bearer</label>
-    <input id="token" value="asl_test!@" />
     <button id="resetBtn" title="Start a new conversation">New chat</button>
   </div>
 
@@ -167,14 +207,19 @@
 </div>
 
 <script>
-  const API_URL = "http://localhost:8000/api/chat";
+  // Local FastAPI endpoint (python app.py). Use /api/chat for the full
+  // Simcomm contract (requires Bearer token). Switch to /remote/chat to hit
+  // the DEPLOYED AgentCore runtime instead (no token needed there).
+  const API_URL   = "http://localhost:8000/api/chat";
+  const LOGIN_URL = "http://localhost:8000/auth/app-login";
+  // Chat Bearer token — NOT hardcoded. It's obtained from /auth/app-login only
+  // after the correct app-access password is entered on the lock screen.
+  let API_TOKEN = "";
 
   const logEl = document.getElementById("log");
   const inputEl = document.getElementById("input");
   const sendBtn = document.getElementById("sendBtn");
   const resetBtn = document.getElementById("resetBtn");
-  const tokenEl = document.getElementById("token");
-
   let conversationId = newConvId();
   let lastQuickReplyTitles = [];
 
@@ -194,7 +239,7 @@
   function addMeta(text) { addBubble(text, "meta"); }
 
   function clearQuickReplies() {
-    document.querySelectorAll(".quick-replies").forEach(e => e.remove());
+    document.querySelectorAll(".quick-replies, .date-picker").forEach(e => e.remove());
   }
 
   function renderQuickReplies(options) {
@@ -213,6 +258,59 @@
     logEl.scrollTop = logEl.scrollHeight;
   }
 
+  // Flow states that should render a calendar picker instead of buttons.
+  const RANGE_STATES  = ["date_range_30", "dp_date_selection", "order_date_selection"];
+  const SINGLE_STATES = ["single_date"];
+
+  function fmt(d) {
+    // Date obj → DD-MM-YYYY
+    const p = n => String(n).padStart(2, "0");
+    return `${p(d.getDate())}-${p(d.getMonth() + 1)}-${p(d.getFullYear())}`;
+  }
+  function isoOffset(days) {
+    const d = new Date(); d.setDate(d.getDate() + days);
+    return d.toISOString().slice(0, 10); // YYYY-MM-DD for <input type=date>
+  }
+
+  function renderDatePicker(reference) {
+    clearQuickReplies();
+    lastQuickReplyTitles = [];
+    const isRange = RANGE_STATES.includes(reference);
+    const todayISO = isoOffset(0);
+    const minISO   = isRange ? isoOffset(-30) : isoOffset(-3650);
+
+    const box = document.createElement("div");
+    box.className = "date-picker";
+
+    if (isRange) {
+      box.innerHTML =
+        `<div class="row"><label>From</label><input type="date" id="dpFrom" min="${minISO}" max="${todayISO}" value="${isoOffset(-30)}"></div>` +
+        `<div class="row"><label>To</label><input type="date" id="dpTo" min="${minISO}" max="${todayISO}" value="${todayISO}"></div>` +
+        `<div class="hint">Select a range within the last 30 days.</div>` +
+        `<button id="dpGo">Generate statement</button>`;
+    } else {
+      box.innerHTML =
+        `<div class="row single"><label>Date</label><input type="date" id="dpFrom" min="${minISO}" max="${todayISO}" value="${todayISO}"></div>` +
+        `<button id="dpGo">Continue</button>`;
+    }
+    logEl.appendChild(box);
+    logEl.scrollTop = logEl.scrollHeight;
+
+    box.querySelector("#dpGo").onclick = () => {
+      const fromEl = box.querySelector("#dpFrom");
+      const toEl   = box.querySelector("#dpTo");
+      if (!fromEl.value) return;
+      const from = fmt(new Date(fromEl.value + "T00:00:00"));
+      if (isRange) {
+        if (!toEl.value) return;
+        const to = fmt(new Date(toEl.value + "T00:00:00"));
+        send(`${from} to ${to}`, true);
+      } else {
+        send(from, true);
+      }
+    };
+  }
+
   function showTyping() {
     const div = document.createElement("div");
     div.className = "typing";
@@ -229,6 +327,7 @@
   async function send(message, isButtonTap) {
     message = (message || "").trim();
     if (!message) return;
+    if (!API_TOKEN) { showLockErr("Enter the password to unlock the chat."); return; }
 
     const isQuick = isButtonTap || lastQuickReplyTitles.includes(message);
     const event = isQuick ? "postback" : "Incoming message";
@@ -248,23 +347,20 @@
     };
 
     try {
+      const headers = { "Content-Type": "application/json" };
+      // /api/chat requires a Bearer token; /remote/chat ignores it.
+      if (API_TOKEN) headers["Authorization"] = "Bearer " + API_TOKEN;
       const resp = await fetch(API_URL, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": "Bearer " + tokenEl.value.trim(),
-        },
+        headers: headers,
         body: JSON.stringify(body),
       });
       hideTyping();
 
-      if (resp.status === 401) {
-        addBubble("⚠️ 401 Unauthorized — check the Bearer token above (WEB_API_TOKEN).", "bot");
-        return;
-      }
       if (!resp.ok) {
         const errText = await resp.text();
-        addBubble("⚠️ HTTP " + resp.status + ": " + errText, "bot");
+        addBubble("⚠️ HTTP " + resp.status + ": " + errText +
+          "\n\nIs the local proxy running?  cd chatbot_web && python app.py", "bot");
         return;
       }
 
@@ -274,16 +370,32 @@
       if (eventid === "1002") {
         const summary = (data.context && data.context.summary) || "Escalated to a live agent.";
         addBubble("🔺 " + summary, "bot");
-        return;
+      } else {
+        const reply = data.message || "(no message in response)";
+        addBubble(reply, "bot");
+        // Support both response shapes:
+        //  - /api/chat (Simcomm):  data.quickReplies.options[] {identifier,title}
+        //  - /remote/chat (runtime): data.quick_replies[] {identifier,title}
+        const opts =
+          (data.quickReplies && data.quickReplies.options) ||
+          data.quick_replies ||
+          [];
+        // The backend sets quickReplies.reference = flow_state. For date-range
+        // steps, render a calendar picker instead of quick-reply buttons.
+        const reference =
+          (data.quickReplies && data.quickReplies.reference) ||
+          data.flow_state || "";
+        if (RANGE_STATES.includes(reference) || SINGLE_STATES.includes(reference)) {
+          renderDatePicker(reference);
+        } else {
+          renderQuickReplies(opts);
+        }
       }
 
-      const reply = data.message || "(no message in response)";
-      addBubble(reply, "bot");
-      renderQuickReplies(data.quickReplies && data.quickReplies.options);
     } catch (err) {
       hideTyping();
       addBubble("⚠️ Request failed: " + err.message +
-        "\n\nIs the backend running?  cd chatbot_web && python app.py", "bot");
+        "\n\nIs the local proxy running?  cd chatbot_web && python app.py", "bot");
     } finally {
       sendBtn.disabled = false;
       inputEl.focus();
@@ -303,8 +415,58 @@
   });
   resetBtn.onclick = resetChat;
 
-  addMeta("New conversation started. Type 'hi' to see the main menu.");
-  inputEl.focus();
+  // ── Top-right app-access lock control ───────────────────────────────────
+  const lockPwd = document.getElementById("lockPwd");
+  const lockBtn = document.getElementById("lockBtn");
+  const lockErr = document.getElementById("lockErr");
+  const lockOk  = document.getElementById("lockOk");
+
+  function showLockErr(msg) {
+    lockErr.textContent = msg;
+    lockErr.style.display = msg ? "block" : "none";
+  }
+
+  // Keep the chat locked until login succeeds.
+  sendBtn.disabled = true;
+  inputEl.disabled = true;
+
+  async function appLogin() {
+    const pwd = (lockPwd.value || "").trim();
+    if (!pwd) { showLockErr("Please enter the password."); return; }
+    lockBtn.disabled = true;
+    showLockErr("");
+    try {
+      const resp = await fetch(LOGIN_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password: pwd }),
+      });
+      if (!resp.ok) {
+        showLockErr(resp.status === 401
+          ? "Invalid password. Try again."
+          : "Login failed (HTTP " + resp.status + "). Is app.py running?");
+        lockBtn.disabled = false;
+        return;
+      }
+      const data = await resp.json();
+      API_TOKEN = data.token;                 // unlock: store the chat token
+      // Collapse the lock control into a ✓ and enable the chat.
+      lockPwd.style.display = "none";
+      lockBtn.style.display = "none";
+      lockOk.style.display  = "inline";
+      sendBtn.disabled = false;
+      inputEl.disabled = false;
+      addMeta("Chat unlocked. Type 'hi' to see the main menu.");
+      inputEl.focus();
+    } catch (err) {
+      showLockErr("Request failed: " + err.message + " — is app.py running?");
+      lockBtn.disabled = false;
+    }
+  }
+
+  lockBtn.onclick = appLogin;
+  lockPwd.addEventListener("keydown", e => { if (e.key === "Enter") appLogin(); });
+  lockPwd.focus();
 </script>
 </body>
 </html>

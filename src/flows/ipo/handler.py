@@ -40,7 +40,7 @@ def handle_ipo(state: SessionState, customer_message: str) -> tuple[InternalMess
         customer_name = state.customer_name or "Valued Customer"
         if not customer_name or customer_name == "Valued Customer":
             try:
-                from src.core.strands_agent import get_profile
+                from src.core.langchain_agent import get_profile
                 profile = get_profile(state.sub_account_id or "")
                 customer_name = profile.name or "Valued Customer"
                 state = state.model_copy(update={"customer_name": customer_name})

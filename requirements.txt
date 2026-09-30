@@ -1,12 +1,15 @@
-# chatbot_web — Web Channel Pre-Login Agent
+# chatbot_langchain — Web Channel Pre-Login Agent (LangChain variant)
 # Deployed to AWS BedrockAgentCore Runtime
-# Same dependency pattern as chatbot/
+# LangChain port of chatbot_web — agentic layer uses LangChain instead of Strands.
 
 # ── Bedrock AgentCore SDK ──────────────────────────────────────────────────
 bedrock-agentcore>=1.14.1,<2.0.0
 
-# ── Strands Agents — tool decorator + agent orchestration ─────────────────
-strands-agents>=0.1.0
+# ── LangChain — tool binding + agent orchestration (replaces Strands) ──────
+# ChatBedrockConverse (langchain-aws) drives the Bedrock Converse API; the @tool
+# / StructuredTool binding lives in langchain-core.
+langchain-core>=1.2.19,<2.0.0
+langchain-aws>=1.0.0,<2.0.0
 
 # ── AWS SDK ────────────────────────────────────────────────────────────────
 boto3>=1.43.49,<2.0.0

@@ -1,19 +1,34 @@
 """
-chatbot_web/src/flows/statement/handler.py
+chatbot_langchain/src/flows/statement/handler.py
 -------------------------------------------
 Statement flow — post-login, requires sub_account_id.
 
-Optimised pattern:
-  - LLM handles customer INPUT (extracts selection from free text)
-  - Response messages and quick_replies are HARDCODED (no LLM for output)
-  - LLM only called when regex/exact match fails for free text input
+Implements the full statement spec:
+  Tax Reports    → Tax Statement (FY), Pan Level Transaction Report (segment→FY),
+                   Portfolio Holding Statement (FY)
+  Demat Reports  → Demat Holding cum Transaction (month), CML Reports (direct),
+                   DP Transaction Statement (month), Statement of DP Holding (date)
+  Trading Reports (sub-tabs):
+                   Contract Note → Common / Commodity / Commodity Physical (30-day range)
+                   M2M → M2M (n/a) / Derivative Physical Bills (30-day range)
+                   Daily Margin Report → Equity (n/a) / Commodity (30-day range)
+                   Global Statement (Trade Summary) (FY)
+                   Ledger Report (FY)
+                   Trade book report (segment→30-day range)
+                   Other Reports → SLBM / SOAROS / Retention
 
-State machine:
-  start → account status check → show category buttons
-  statement_category → report list buttons
-  report_type        → date picker buttons
-  date_range_fy / date_range_aod / date_range_month → API call → hardcoded confirm
-  session_end_response → shared
+Date inputs:
+  fy_picker        → financial-year buttons
+  month_picker     → year → month
+  single_date      → single date (default today)
+  date_range_30    → 30-day date range (start,end DD-MM-YYYY)
+  segment_then_fy  → market segment → FY
+  segment_then_range → market segment → 30-day range
+  cml_direct       → no picker, send immediately
+  unavailable      → report not serviceable by the API (informational message)
+
+Response messages + quick replies are HARDCODED; the LLM is used only to
+extract a selection from free-text input when exact/regex match fails.
 """
 
 from __future__ import annotations
@@ -21,7 +36,7 @@ from __future__ import annotations
 import calendar
 import logging
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from src.core.llm import call_intent_llm
 from src.core.session_store import save_session
@@ -31,26 +46,52 @@ from models import InternalMessageResponse, SessionState
 logger = logging.getLogger(__name__)
 
 # ── Report catalogue ──────────────────────────────────────────────────────────
-
 TOP_CATEGORIES = ["Tax Reports", "Demat Reports", "Trading Reports"]
 
-REPORTS_BY_CATEGORY = {
+# Market segments (for segment-first reports).
+SEGMENTS = ["Equity", "Commodity", "Derivatives", "Currency"]
+
+# A report:
+#   {"name", "jobname", "endpoint": exports|sendmail, "date_input", ["unavailable": True]}
+# A sub-tab (Trading Reports only):
+#   {"name", "subtab": True, "reports": [ ...report dicts... ]}
+REPORTS_BY_CATEGORY: dict[str, list[dict]] = {
     "Tax Reports": [
-        {"name": "Tax Statement",    "jobname": "Tax Statement",    "endpoint": "exports",  "date_input": "fy_picker"},
-        {"name": "P&L Statement",    "jobname": "P&L Statement",    "endpoint": "exports",  "date_input": "fy_picker"},
-        {"name": "Capital Gains",    "jobname": "Capital Gains",    "endpoint": "exports",  "date_input": "fy_picker"},
+        {"name": "Tax Statement",                "jobname": "Tax Statement",                   "endpoint": "exports",  "date_input": "fy_picker"},
+        {"name": "Pan Level Transaction Report", "jobname": "Pan-Level Transaction Statement", "endpoint": "exports",  "date_input": "segment_then_fy"},
+        {"name": "Portfolio Holding Statement",  "jobname": "Portfolio Holding Statement",     "endpoint": "exports",  "date_input": "fy_picker"},
     ],
     "Demat Reports": [
-        {"name": "DP Holdings",              "jobname": "DP Holdings",  "endpoint": "exports",  "date_input": "as_on_date"},
-        {"name": "DP Transaction Statement", "jobname": "DP",           "endpoint": "sendmail", "date_input": "month_picker"},
-        {"name": "CML Report (NSDL)",        "jobname": "NSDLCML",      "endpoint": "sendmail", "date_input": "month_picker"},
+        # Email-automation alignment: "DP holding cum transaction statement" == the
+        # email automation's "dp transaction statement" → jobname DP (send-mail).
+        {"name": "Demat Holding cum Transaction Statement", "jobname": "DP", "endpoint": "sendmail", "date_input": "month_picker"},
+        # Email-automation alignment: CML sends BOTH depositories (CDSL + NSDL).
+        {"name": "CML Reports",                    "jobname": "CDSLCML,NSDLCML", "endpoint": "sendmail", "date_input": "cml_direct"},
+        {"name": "DP Transaction Statement",       "jobname": "DP",      "endpoint": "sendmail", "date_input": "month_picker"},
+        {"name": "Statement of DP Holding",        "jobname": "DP",      "endpoint": "sendmail", "date_input": "single_date"},
     ],
     "Trading Reports": [
-        {"name": "Ledger Report",            "jobname": "Ledger Report",        "endpoint": "exports",  "date_input": "fy_picker"},
-        {"name": "Contract Notes",           "jobname": "CommonContractNotes",  "endpoint": "sendmail", "date_input": "month_picker"},
-        {"name": "Account Statement",        "jobname": "Account Statement",    "endpoint": "exports",  "date_input": "fy_picker"},
-        {"name": "Global Statement (AGTS)",  "jobname": "AGTS",                 "endpoint": "sendmail", "date_input": "month_picker"},
-        {"name": "Equity Margin",            "jobname": "EquityMargin",         "endpoint": "sendmail", "date_input": "month_picker"},
+        {"name": "Contract Note", "subtab": True, "reports": [
+            {"name": "Common Contract Notes",              "jobname": "CommonContractNotes",           "endpoint": "sendmail", "date_input": "date_range_30"},
+            {"name": "Commodity Contract Notes",           "jobname": "CommodityContractNotes",        "endpoint": "sendmail", "date_input": "date_range_30"},
+            {"name": "Commodity Physical Delivery Contract Notes", "jobname": "CommodityContractNotesPhysical", "endpoint": "sendmail", "date_input": "date_range_30"},
+        ]},
+        {"name": "M2M", "subtab": True, "reports": [
+            {"name": "M2M",                        "jobname": "",                        "endpoint": "sendmail", "date_input": "unavailable"},
+            {"name": "Derivative Physical Bills",  "jobname": "DerivativePhysicalBills", "endpoint": "sendmail", "date_input": "date_range_30"},
+        ]},
+        {"name": "Daily Margin Report", "subtab": True, "reports": [
+            {"name": "Equity Daily Margin",    "jobname": "",                     "endpoint": "sendmail", "date_input": "unavailable"},
+            {"name": "Commodity Daily Margin", "jobname": "CommodityDailyMargin", "endpoint": "sendmail", "date_input": "date_range_30"},
+        ]},
+        {"name": "Global Statement (Trade Summary)", "jobname": "AGTS",                 "endpoint": "sendmail", "date_input": "fy_picker"},
+        {"name": "Ledger Report",                     "jobname": "Ledger Statement",     "endpoint": "exports",  "date_input": "fy_picker"},
+        {"name": "Trade book report",                 "jobname": "Trade Book Statement", "endpoint": "exports",  "date_input": "segment_then_range"},
+        {"name": "Other Reports", "subtab": True, "reports": [
+            {"name": "SLBM",       "jobname": "SLBMContractNotes",  "endpoint": "sendmail", "date_input": "date_range_30"},
+            {"name": "SOAROS",     "jobname": "SOAcumROS",          "endpoint": "sendmail", "date_input": "date_range_30"},
+            {"name": "Retention",  "jobname": "RetentionStatement", "endpoint": "sendmail", "date_input": "month_picker"},
+        ]},
     ],
 }
 
@@ -58,14 +99,30 @@ MONTH_NAMES = ["January","February","March","April","May","June",
                "July","August","September","October","November","December"]
 YEAR_OPTIONS = [str(date.today().year - i) for i in range(3)]
 
-ALL_REPORT_NAMES = [r["name"] for cat in REPORTS_BY_CATEGORY.values() for r in cat]
+
+def _top_items(category: str) -> list[dict]:
+    return REPORTS_BY_CATEGORY.get(category, [])
 
 
-def _get_report(name: str) -> dict | None:
-    for reports in REPORTS_BY_CATEGORY.values():
-        for r in reports:
-            if r["name"].lower() == name.lower():
-                return r
+def _find_report(name: str) -> dict | None:
+    """Find a leaf report by name anywhere in the catalogue (incl. sub-tabs)."""
+    n = (name or "").strip().lower()
+    for items in REPORTS_BY_CATEGORY.values():
+        for it in items:
+            if it.get("subtab"):
+                for r in it["reports"]:
+                    if r["name"].lower() == n:
+                        return r
+            elif it["name"].lower() == n:
+                return it
+    return None
+
+
+def _find_subtab(category: str, name: str) -> dict | None:
+    n = (name or "").strip().lower()
+    for it in _top_items(category):
+        if it.get("subtab") and it["name"].lower() == n:
+            return it
     return None
 
 
@@ -76,484 +133,368 @@ def _financial_years() -> list[str]:
 
 
 def _clamp_future(d: date) -> date:
-    """Never allow a date in the future — the reports API rejects future
-    end_dates with 400 'end_date cannot be in the future'."""
     today = date.today()
     return today if d > today else d
 
 
-def _resolve_dates(label: str) -> tuple[str, str]:
-    today = date.today()
+def _resolve_fy_dates(label: str) -> tuple[str, str]:
     fy = re.match(r"FY\s*(\d{4})-(\d{2})", label, re.IGNORECASE)
     if fy:
         y = int(fy.group(1))
         start = date(y, 4, 1)
-        end   = date(y + 1, 3, 31)
-        # For the current (ongoing) FY, 31-Mar is in the future → clamp to today.
-        end   = _clamp_future(end)
+        end   = _clamp_future(date(y + 1, 3, 31))
         return start.strftime("%d-%m-%Y"), end.strftime("%d-%m-%Y")
-    iso = re.match(r"(\d{4})-(\d{2})-(\d{2})", label)
-    if iso:
-        d = _clamp_future(date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3))))
-        ds = d.strftime("%d-%m-%Y")
-        return ds, ds
-    m = re.match(r"^(\d{2})-(\d{2})-(\d{4})$", label)
+    today = date.today()
+    return (today - timedelta(days=90)).strftime("%d-%m-%Y"), today.strftime("%d-%m-%Y")
+
+
+def _parse_date(text: str) -> date | None:
+    """Parse DD-MM-YYYY or DD/MM/YYYY."""
+    m = re.search(r"\b(\d{2})[-/](\d{2})[-/](\d{4})\b", text)
     if m:
-        d = _clamp_future(date(int(m.group(3)), int(m.group(2)), int(m.group(1))))
-        ds = d.strftime("%d-%m-%Y")
-        return ds, ds
-    s = today - timedelta(days=90)
-    return s.strftime("%d-%m-%Y"), today.strftime("%d-%m-%Y")
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
+    return None
 
 
-# ── Hardcoded response messages ───────────────────────────────────────────────
+def _parse_range(text: str) -> tuple[date, date] | None:
+    """Extract two DD-MM-YYYY/DD-MM-YYYY dates from free text (start, end)."""
+    dates = re.findall(r"\b(\d{2})[-/](\d{2})[-/](\d{4})\b", text)
+    if len(dates) >= 2:
+        try:
+            d1 = date(int(dates[0][2]), int(dates[0][1]), int(dates[0][0]))
+            d2 = date(int(dates[1][2]), int(dates[1][1]), int(dates[1][0]))
+            return (d1, d2) if d1 <= d2 else (d2, d1)
+        except ValueError:
+            return None
+    return None
 
+
+# The 30-day range step renders as a CALENDAR range picker in the UI (the UI
+# keys off the flow_state "date_range_30" via quickReplies.reference). No quick
+# replies are sent; the picker posts "DD-MM-YYYY to DD-MM-YYYY", parsed below.
+def _preset_range(label: str) -> tuple[date, date] | None:
+    """Optional preset labels still accepted for convenience (Last 7/15/30 days)."""
+    days = {"last 7 days": 7, "last 15 days": 15, "last 30 days": 30}.get(
+        (label or "").strip().lower())
+    if not days:
+        return None
+    today = date.today()
+    return (today - timedelta(days=days - 1), today)
+
+
+# ── Hardcoded messages (per spec) ─────────────────────────────────────────────
 def _msg_category() -> str:
     return "Which type of statement do you need?"
 
 def _msg_reports(category: str) -> str:
     return f"Please select a report from {category}:"
 
+def _msg_subtab(name: str) -> str:
+    return f"Please select a report under {name}:"
+
 def _msg_fy() -> str:
-    return "Please select a financial year:"
+    return "Please select the financial year."
+
+def _msg_segment() -> str:
+    return "Please select the segment."
 
 def _msg_month_year() -> str:
-    return "Please select the year:"
+    return "Please select the desired year from below options to generate the statement."
 
 def _msg_month_name() -> str:
-    return "Please select the month:"
+    return "Please select month from dropdown."
 
-def _msg_aod(today_str: str) -> str:
-    return f"Please select the date (default: {today_str}):"
+def _msg_single_date(today_str: str) -> str:
+    return f"Please select a date (default: {today_str})."
+
+def _msg_range() -> str:
+    return ("Please select a date range within 30 days from the calendar "
+            "(DD-MM-YYYY to DD-MM-YYYY) to generate the statement.")
+
+def _msg_range_wrong() -> str:
+    return "Please choose a date range within the 30 days from your request."
+
+def _msg_cml_ack() -> str:
+    return ("We have received your request for NSDL CML and it will be sent to "
+            "your registered email ID shortly.")
 
 def _msg_confirm(report_name: str, masked_email: str) -> str:
-    return (
-        f"We have shared the requested {report_name} on your registered "
-        f"email {masked_email}. You will receive it shortly."
-    )
+    return (f"We have shared the requested {report_name} on your registered "
+            f"email {masked_email}. You will receive it shortly.")
+
+def _msg_no_data_fy() -> str:
+    return "Sorry, no statement was found for the requested financial year."
+
+def _msg_no_data_month() -> str:
+    return "Sorry, no statement was found for the selected month."
+
+def _msg_no_data_date() -> str:
+    return "Sorry, we have not found any statement for the selected date."
+
+def _msg_unavailable(report_name: str) -> str:
+    return (f"{report_name} is currently not available through chat. "
+            "Please use the Axis Direct portal to download this report.")
 
 def _msg_deactivated() -> str:
-    return (
-        "Your account is currently deactivated. Please contact our support team "
-        "to reactivate your account before requesting statements.\n\n"
-        "📞 Customer Care: 022-40508080 / 022-61480808"
-    )
+    return ("Your account is currently deactivated. Please contact our support team "
+            "to reactivate your account before requesting statements.\n\n"
+            "📞 Customer Care: 022-40508080 / 022-61480808")
 
-def _msg_reprompt_category() -> str:
-    return "I didn't catch that. Please select a statement category:"
-
-def _msg_reprompt_report(reports: list[str]) -> str:
-    return f"Please choose one of the available reports:"
-
-def _msg_reprompt_fy() -> str:
-    return "Please select a valid financial year from the options:"
-
-def _msg_reprompt_month() -> str:
-    return "Please select from the options shown:"
+_END_QR = ["Go back to main menu", "End Chat"]
 
 
-# ── LLM extraction (input only — extracts selection from free text) ───────────
-
+# ── LLM extraction (free-text input only) ─────────────────────────────────────
 _EXTRACT_CATEGORY_SYS = """\
 The customer is choosing a statement category on Axis Direct.
 Options: "Tax Reports", "Demat Reports", "Trading Reports"
-Extract which category the customer meant from their message.
-Return JSON only:
-{"selected": "<exact option name or null>", "reasoning": "<one line>"}
+Return JSON only: {"selected": "<exact option or null>"}
 """
-
-_EXTRACT_REPORT_SYS = """\
-The customer is selecting a statement report type on Axis Direct.
-Extract which report name they meant. Available reports are in context.
-Return JSON only:
-{"selected": "<exact report name or null>", "reasoning": "<one line>"}
+_EXTRACT_PICK_SYS = """\
+The customer is selecting an item from a menu on Axis Direct.
+The available items are in context under "options".
+Return JSON only: {"selected": "<exact item name or null>"}
 """
-
 _EXTRACT_FY_SYS = """\
-The customer is selecting a financial year on Axis Direct.
-Available options are in context under "options".
-Extract which financial year they meant (e.g. "FY 2025-26", "last year", "this year").
-Return JSON only:
-{"selected": "<exact FY label or null>", "reasoning": "<one line>"}
+The customer is selecting a financial year on Axis Direct (options in context).
+Return JSON only: {"selected": "<exact FY label or null>"}
 """
-
 _EXTRACT_DATE_SYS = """\
-The customer is selecting a month/date for their statement on Axis Direct.
-Extract which month name or date they mentioned.
-Return JSON only:
-{"selected_month": "<month name or null>", "selected_year": "<4-digit year or null>", "selected_date": "<DD-MM-YYYY or null>", "reasoning": "<one line>"}
+The customer is selecting a month/year for their statement on Axis Direct.
+Return JSON only: {"selected_month": "<month name or null>", "selected_year": "<4-digit year or null>"}
 """
 
 
-def _extract_via_llm(system: str, message: str, context: dict | None = None) -> dict:
-    """Call Haiku to extract selection from free-text input. Returns parsed dict."""
-    ctx = ""
-    if context:
-        ctx = "\n".join(f"{k}: {v}" for k, v in context.items())
-    full_msg = f"{ctx}\n\nCustomer message: {message}" if ctx else f"Customer message: {message}"
-    result = call_intent_llm(system, [{"role": "user", "content": [{"text": full_msg}]}])
+def _extract(system: str, message: str, context: dict | None = None) -> dict:
+    ctx = "\n".join(f"{k}: {v}" for k, v in (context or {}).items())
+    full = f"{ctx}\n\nCustomer message: {message}" if ctx else f"Customer message: {message}"
+    result = call_intent_llm(system, [{"role": "user", "content": [{"text": full}]}])
     return result.get("parsed") or {}
 
 
-def _match_exact(text: str, options: list[str]) -> str | None:
-    """Exact or case-insensitive match against a list of options."""
+def _match(text: str, options: list[str]) -> str | None:
     tl = text.strip().lower()
     for opt in options:
         if opt.lower() == tl:
             return opt
-    # partial match
-    for opt in options:
-        if opt.lower() in tl or tl in opt.lower():
-            return opt
+    # EXACT match only. Non-exact (typed/free-text) input is left for the LLM
+    # (Haiku) extractor — we don't guess via substring, per the routing rule
+    # "exact predefined match → programmatic; everything else → Haiku".
     return None
 
 
-def _save_hist(state: SessionState, msg: str, reply: str) -> list:
+def _hist(state: SessionState, msg: str, reply: str) -> list:
     return state.history + [
-        {"role": "user",      "content": msg},
+        {"role": "user", "content": msg},
         {"role": "assistant", "content": reply},
     ]
 
 
-def _send_and_confirm(
-    state: SessionState,
-    report: dict,
-    start_date: str,
-    end_date: str,
-    customer_message: str,
-) -> tuple[InternalMessageResponse, SessionState]:
-    """Call statement API (via Strands agent, direct fallback) — confirm on success."""
-    from src.gateways.statement_api import request_statement_fireandforget
+def _reply(state, reply, qr, flow_state, status="ok", update=None):
+    ns = state.model_copy(update={**(update or {}), "flow_state": flow_state,
+                                  "history": _hist(state, "", reply) if False else state.history})
+    return ns  # placeholder — not used; helpers below build responses inline
 
+
+# ── Send + confirm ─────────────────────────────────────────────────────────────
+def _send_and_confirm(state, report, start_date, end_date, customer_message, no_data_msg):
+    """Call statement API; confirm on success, show no-data/unavailable otherwise."""
+    from src.gateways.statement_api import request_statement_fireandforget
     try:
-        # Agent-orchestrated tool call; falls back to the direct gateway call.
         result = None
         try:
-            from src.core.strands_agent import run_tool
+            from src.core.langchain_agent import run_tool
+            from src.gateways.statement_api import StatementResult
             tool_out = run_tool(
                 "request_statement",
                 sub_account_id=state.sub_account_id or "",
                 report_name=report["jobname"],
-                start_date=start_date,
-                end_date=end_date,
-                endpoint=report["endpoint"],
+                start_date=start_date, end_date=end_date, endpoint=report["endpoint"],
             )
             if tool_out is not None:
-                # Adapt the tool dict to the StatementResult-like shape the flow uses.
-                from src.gateways.statement_api import StatementResult
                 result = StatementResult(
                     success=bool(tool_out.get("success")),
                     masked_email=tool_out.get("masked_email", "") or "",
                     error_message=tool_out.get("error") or "",
                 )
         except Exception as exc:
-            logger.warning("[STATEMENT] agent tool path failed: %s — falling back direct", exc)
-
+            logger.warning("[STATEMENT] agent tool path failed: %s — direct fallback", exc)
         if result is None:
             result = request_statement_fireandforget(
                 sub_account_id=state.sub_account_id or "",
-                api_jobname=report["jobname"],
-                endpoint=report["endpoint"],
-                start_date=start_date,
-                end_date=end_date,
+                api_jobname=report["jobname"], endpoint=report["endpoint"],
+                start_date=start_date, end_date=end_date,
             )
     except Exception as exc:
         logger.error("[STATEMENT] API call failed: %s", exc)
-        reply = (
-            "We were unable to process your request at this time. "
-            "Please try again later or contact support at 022-40508080."
-        )
-        hist  = _save_hist(state, customer_message, reply)
-        ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=reply,
-                quick_reply_options=["Go back to main menu", "End Chat"],
-                flow_state="session_end_response",
-                status="error",
-            ),
-            ns,
-        )
+        result = None
 
-    if not result.success:
-        reply = (
-            "We were unable to process your request at this time. "
-            "Please try again later or contact support at 022-40508080."
-        )
-    else:
+    if result is None:
+        reply = ("We were unable to process your request at this time. "
+                 "Please try again later or contact support at 022-40508080.")
+        status = "error"
+    elif result.success:
         masked = result.masked_email or "your registered email"
-        reply  = _msg_confirm(report["name"], masked)
+        reply = _msg_confirm(report["name"], masked)
+        status = "ok"
+    else:
+        # "No documents found" → per-spec no-data message; other errors → generic.
+        err = (result.error_message or "").lower()
+        if "no documents" in err or "not found" in err or "502" in err:
+            reply = no_data_msg
+        else:
+            reply = ("We were unable to process your request at this time. "
+                     "Please try again later or contact support at 022-40508080.")
+        status = "ok"
 
-    hist  = _save_hist(state, customer_message, reply)
-    ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
+    ns = state.model_copy(update={"flow_state": "session_end_response",
+                                  "history": _hist(state, customer_message, reply)})
     save_session(state.conversation_id, ns)
-    return (
-        InternalMessageResponse(
-            reply_message=reply,
-            quick_reply_options=["Go back to main menu", "End Chat"],
-            flow_state="session_end_response",
-            status="ok" if result.success else "error",
-        ),
-        ns,
-    )
+    return (InternalMessageResponse(reply_message=reply, quick_reply_options=_END_QR,
+                                    flow_state="session_end_response", status=status), ns)
+
+
+def _resp(state, reply, qr, flow_state, customer_message, status="ok", update=None):
+    ns = state.model_copy(update={**(update or {}), "flow_state": flow_state,
+                                  "history": _hist(state, customer_message, reply)})
+    save_session(state.conversation_id, ns)
+    return (InternalMessageResponse(reply_message=reply, quick_reply_options=qr,
+                                    flow_state=flow_state, status=status), ns)
 
 
 # ── Main handler ──────────────────────────────────────────────────────────────
-
-def handle_statement(
-    state: SessionState,
-    customer_message: str,
-) -> tuple[InternalMessageResponse, SessionState]:
-
+def handle_statement(state: SessionState, customer_message: str) -> tuple[InternalMessageResponse, SessionState]:
     fs = state.flow_state
+    cd = state.collected_data
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
-        from src.core.strands_agent import get_profile
+        from src.core.langchain_agent import get_profile
         try:
-            profile = get_profile(state.sub_account_id or "")
-            status  = profile.account_status
+            status = get_profile(state.sub_account_id or "").account_status
         except Exception:
             status = "active"
-
         if status in ("deactivated", "purged"):
-            reply = _msg_deactivated()
-            hist  = _save_hist(state, customer_message, reply)
-            ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=reply,
-                    quick_reply_options=["Go back to main menu", "End Chat"],
-                    flow_state="session_end_response",
-                    status="end",
-                ),
-                ns,
-            )
+            return _resp(state, _msg_deactivated(), _END_QR, "session_end_response",
+                         customer_message, status="end", update={"flow": "statement"})
+        return _resp(state, _msg_category(), TOP_CATEGORIES, "statement_category",
+                     customer_message, update={"flow": "statement"})
 
-        reply = _msg_category()
-        hist  = _save_hist(state, customer_message, reply)
-        ns = state.model_copy(update={
-            "flow": "statement", "flow_state": "statement_category", "history": hist,
-        })
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=reply,
-                quick_reply_options=TOP_CATEGORIES,
-                flow_state="statement_category",
-                status="ok",
-            ),
-            ns,
-        )
-
-    # ── CATEGORY SELECTION ────────────────────────────────────────────────────
+    # ── CATEGORY ───────────────────────────────────────────────────────────────
     if fs == "statement_category":
-        # 1. Try exact/partial match first
-        cat = _match_exact(customer_message, TOP_CATEGORIES)
+        cat = _match(customer_message, TOP_CATEGORIES) or _extract(_EXTRACT_CATEGORY_SYS, customer_message).get("selected")
+        if cat not in TOP_CATEGORIES:
+            return _resp(state, "Please select a statement category:", TOP_CATEGORIES,
+                         "statement_category", customer_message, status="reprompt")
+        item_names = [it["name"] for it in _top_items(cat)]
+        return _resp(state, _msg_reports(cat), item_names, "report_type", customer_message,
+                     update={"collected_data": {**cd, "category": cat}})
 
-        # 2. LLM extraction for free text
-        if not cat:
-            parsed = _extract_via_llm(_EXTRACT_CATEGORY_SYS, customer_message)
-            cat = parsed.get("selected")
-
-        if not cat or cat not in TOP_CATEGORIES:
-            reply = _msg_reprompt_category()
-            hist  = _save_hist(state, customer_message, reply)
-            ns = state.model_copy(update={"history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=reply,
-                    quick_reply_options=TOP_CATEGORIES,
-                    flow_state="statement_category",
-                    status="reprompt",
-                ),
-                ns,
-            )
-
-        reports = [r["name"] for r in REPORTS_BY_CATEGORY[cat]]
-        reply = _msg_reports(cat)
-        hist  = _save_hist(state, customer_message, reply)
-        ns = state.model_copy(update={
-            "flow_state": "report_type",
-            "collected_data": {**state.collected_data, "category": cat},
-            "history": hist,
-        })
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=reply,
-                quick_reply_options=reports,
-                flow_state="report_type",
-                status="ok",
-            ),
-            ns,
-        )
-
-    # ── REPORT TYPE SELECTION ─────────────────────────────────────────────────
+    # ── TOP-LEVEL ITEM (report or sub-tab) ─────────────────────────────────────
     if fs == "report_type":
-        cat     = state.collected_data.get("category", "")
-        reports = [r["name"] for r in REPORTS_BY_CATEGORY.get(cat, [])]
+        cat = cd.get("category", "")
+        item_names = [it["name"] for it in _top_items(cat)]
+        picked = _match(customer_message, item_names) or _extract(_EXTRACT_PICK_SYS, customer_message, {"options": ", ".join(item_names)}).get("selected")
+        item = next((it for it in _top_items(cat) if picked and it["name"].lower() == picked.lower()), None)
+        if not item:
+            return _resp(state, "Please choose one of the available reports:", item_names,
+                         "report_type", customer_message, status="reprompt")
+        if item.get("subtab"):
+            sub_names = [r["name"] for r in item["reports"]]
+            return _resp(state, _msg_subtab(item["name"]), sub_names, "subtab_select",
+                         customer_message, update={"collected_data": {**cd, "subtab": item["name"]}})
+        return _advance_to_date(state.model_copy(update={"collected_data": {**cd, "report_name": item["name"]}}),
+                                item, customer_message)
 
-        # 1. Exact match
-        report_name = _match_exact(customer_message, reports)
-
-        # 2. LLM extraction
-        if not report_name:
-            parsed = _extract_via_llm(
-                _EXTRACT_REPORT_SYS, customer_message, {"available_reports": ", ".join(reports)}
-            )
-            report_name = parsed.get("selected")
-
-        report = _get_report(report_name) if report_name else None
-
+    # ── SUB-TAB → leaf report ──────────────────────────────────────────────────
+    if fs == "subtab_select":
+        cat = cd.get("category", "")
+        subtab = _find_subtab(cat, cd.get("subtab", ""))
+        reports = subtab["reports"] if subtab else []
+        names = [r["name"] for r in reports]
+        picked = _match(customer_message, names) or _extract(_EXTRACT_PICK_SYS, customer_message, {"options": ", ".join(names)}).get("selected")
+        report = next((r for r in reports if picked and r["name"].lower() == picked.lower()), None)
         if not report:
-            reply = _msg_reprompt_report(reports)
-            hist  = _save_hist(state, customer_message, reply)
-            ns = state.model_copy(update={"history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=reply,
-                    quick_reply_options=reports,
-                    flow_state="report_type",
-                    status="reprompt",
-                ),
-                ns,
-            )
+            return _resp(state, "Please choose one of the available reports:", names,
+                         "subtab_select", customer_message, status="reprompt")
+        return _advance_to_date(state.model_copy(update={"collected_data": {**cd, "report_name": report["name"]}}),
+                                report, customer_message)
 
-        ns = state.model_copy(update={
-            "collected_data": {**state.collected_data, "report_name": report["name"]},
-        })
-        return _advance_to_date(ns, report, customer_message)
+    # ── SEGMENT select ──────────────────────────────────────────────────────────
+    if fs == "segment_select":
+        seg = _match(customer_message, SEGMENTS)
+        if not seg:
+            return _resp(state, _msg_segment(), SEGMENTS, "segment_select", customer_message, status="reprompt")
+        report = _find_report(cd.get("report_name", ""))
+        next_input = (report or {}).get("date_input", "")
+        cd2 = {**cd, "segment": seg}
+        if next_input == "segment_then_fy":
+            return _resp(state, _msg_fy(), _financial_years(), "date_range_fy", customer_message,
+                         update={"collected_data": cd2})
+        # segment_then_range → UI shows a 30-day calendar range picker.
+        return _resp(state, _msg_range(), [], "date_range_30", customer_message,
+                     update={"collected_data": cd2})
 
-    # ── FY PICKER ─────────────────────────────────────────────────────────────
+    # ── FY PICKER ────────────────────────────────────────────────────────────────
     if fs == "date_range_fy":
         fy_opts = _financial_years()
-
-        # 1. Exact match
-        label = _match_exact(customer_message, fy_opts)
-
-        # 2. LLM extraction
+        label = _match(customer_message, fy_opts)
         if not label:
-            parsed = _extract_via_llm(
-                _EXTRACT_FY_SYS, customer_message, {"options": ", ".join(fy_opts)}
-            )
-            label = parsed.get("selected")
-            if label and label not in fy_opts:
-                label = _match_exact(label, fy_opts)
-
+            sel = _extract(_EXTRACT_FY_SYS, customer_message, {"options": ", ".join(fy_opts)}).get("selected")
+            label = _match(sel or "", fy_opts)
         if not label:
-            reply = _msg_reprompt_fy()
-            hist  = _save_hist(state, customer_message, reply)
-            ns = state.model_copy(update={"history": hist})
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=reply,
-                    quick_reply_options=fy_opts,
-                    flow_state="date_range_fy",
-                    status="reprompt",
-                ),
-                ns,
-            )
+            return _resp(state, "Please select a valid financial year from the options:", fy_opts,
+                         "date_range_fy", customer_message, status="reprompt")
+        start, end = _resolve_fy_dates(label)
+        return _send_and_confirm(state, _find_report(cd.get("report_name", "")) or {},
+                                 start, end, customer_message, _msg_no_data_fy())
 
-        start, end = _resolve_dates(label)
-        report = _get_report(state.collected_data.get("report_name", ""))
-        return _send_and_confirm(state, report or {}, start, end, customer_message)
+    # ── SINGLE DATE ──────────────────────────────────────────────────────────────
+    if fs == "single_date":
+        d = _parse_date(customer_message) or date.today()
+        d = _clamp_future(d)
+        ds = d.strftime("%d-%m-%Y")
+        return _send_and_confirm(state, _find_report(cd.get("report_name", "")) or {},
+                                 ds, ds, customer_message, _msg_no_data_date())
 
-    # ── AS-ON-DATE PICKER ─────────────────────────────────────────────────────
-    if fs == "date_range_aod":
-        today_str = date.today().strftime("%d-%m-%Y")
+    # ── 30-DAY DATE RANGE ─────────────────────────────────────────────────────────
+    if fs == "date_range_30":
+        # Preset button ("Last 7/15/30 days") first, then typed range.
+        rng = _preset_range(customer_message) or _parse_range(customer_message)
+        if not rng:
+            return _resp(state, _msg_range(), [], "date_range_30", customer_message, status="reprompt")
+        d1, d2 = rng
+        if (d2 - d1).days > 30 or d2 > date.today():
+            return _resp(state, _msg_range_wrong(), [], "date_range_30", customer_message, status="reprompt")
+        return _send_and_confirm(state, _find_report(cd.get("report_name", "")) or {},
+                                 d1.strftime("%d-%m-%Y"), d2.strftime("%d-%m-%Y"),
+                                 customer_message, _msg_no_data_date())
 
-        # Any response = accept today's date (there's only one option)
-        label = customer_message.strip() or today_str
-        if not re.match(r"^\d{2}-\d{2}-\d{4}$", label):
-            label = today_str
-
-        start, end = _resolve_dates(label)
-        report = _get_report(state.collected_data.get("report_name", ""))
-        return _send_and_confirm(state, report or {}, start, end, customer_message)
-
-    # ── MONTH PICKER ──────────────────────────────────────────────────────────
+    # ── MONTH PICKER (year → month) ───────────────────────────────────────────────
     if fs == "date_range_month":
-        if "selected_year" not in state.collected_data:
-            # Expecting year selection
-            year = _match_exact(customer_message, YEAR_OPTIONS)
-            if not year:
-                parsed = _extract_via_llm(_EXTRACT_DATE_SYS, customer_message)
-                year = parsed.get("selected_year")
-                if year and year not in YEAR_OPTIONS:
-                    year = None
-
-            if not year:
-                reply = _msg_reprompt_month()
-                hist  = _save_hist(state, customer_message, reply)
-                ns = state.model_copy(update={"history": hist})
-                save_session(state.conversation_id, ns)
-                return (
-                    InternalMessageResponse(
-                        reply_message=reply,
-                        quick_reply_options=YEAR_OPTIONS,
-                        flow_state="date_range_month",
-                        status="reprompt",
-                    ),
-                    ns,
-                )
-
-            reply = _msg_month_name()
-            hist  = _save_hist(state, customer_message, reply)
-            ns = state.model_copy(update={
-                "collected_data": {**state.collected_data, "selected_year": year},
-                "history": hist,
-            })
-            save_session(state.conversation_id, ns)
-            return (
-                InternalMessageResponse(
-                    reply_message=reply,
-                    quick_reply_options=MONTH_NAMES,
-                    flow_state="date_range_month",
-                    status="ok",
-                ),
-                ns,
-            )
-
-        else:
-            # Expecting month selection
-            year = state.collected_data["selected_year"]
-            month_name = _match_exact(customer_message, MONTH_NAMES)
-            if not month_name:
-                parsed = _extract_via_llm(_EXTRACT_DATE_SYS, customer_message)
-                month_name = parsed.get("selected_month")
-                if month_name:
-                    month_name = _match_exact(month_name, MONTH_NAMES)
-
-            if not month_name:
-                reply = _msg_reprompt_month()
-                hist  = _save_hist(state, customer_message, reply)
-                ns = state.model_copy(update={"history": hist})
-                save_session(state.conversation_id, ns)
-                return (
-                    InternalMessageResponse(
-                        reply_message=reply,
-                        quick_reply_options=MONTH_NAMES,
-                        flow_state="date_range_month",
-                        status="reprompt",
-                    ),
-                    ns,
-                )
-
-            m_num    = MONTH_NAMES.index(month_name) + 1
-            last_day  = calendar.monthrange(int(year), m_num)[1]
-            start     = f"01-{m_num:02d}-{year}"
-            # Clamp the month-end to today so the current month never sends a
-            # future end_date (the reports API rejects those with 400).
-            end_date  = _clamp_future(date(int(year), m_num, last_day))
-            end       = end_date.strftime("%d-%m-%Y")
-            report    = _get_report(state.collected_data.get("report_name", ""))
-            return _send_and_confirm(state, report or {}, start, end, customer_message)
+        if "selected_year" not in cd:
+            year = _match(customer_message, YEAR_OPTIONS) or _extract(_EXTRACT_DATE_SYS, customer_message).get("selected_year")
+            if year not in YEAR_OPTIONS:
+                return _resp(state, _msg_month_year(), YEAR_OPTIONS, "date_range_month",
+                             customer_message, status="reprompt")
+            return _resp(state, _msg_month_name(), MONTH_NAMES, "date_range_month", customer_message,
+                         update={"collected_data": {**cd, "selected_year": year}})
+        year = cd["selected_year"]
+        month = _match(customer_message, MONTH_NAMES)
+        if not month:
+            sel = _extract(_EXTRACT_DATE_SYS, customer_message).get("selected_month")
+            month = _match(sel or "", MONTH_NAMES)
+        if not month:
+            return _resp(state, _msg_month_name(), MONTH_NAMES, "date_range_month",
+                         customer_message, status="reprompt")
+        m = MONTH_NAMES.index(month) + 1
+        last = calendar.monthrange(int(year), m)[1]
+        start = f"01-{m:02d}-{year}"
+        end = _clamp_future(date(int(year), m, last)).strftime("%d-%m-%Y")
+        return _send_and_confirm(state, _find_report(cd.get("report_name", "")) or {},
+                                 start, end, customer_message, _msg_no_data_month())
 
     if fs == "session_end_response":
         return handle_session_end(state, customer_message)
@@ -562,56 +503,42 @@ def handle_statement(
     return handle_statement(state.model_copy(update={"flow_state": "start"}), customer_message)
 
 
-def _advance_to_date(
-    state: SessionState,
-    report: dict,
-    customer_message: str,
-) -> tuple[InternalMessageResponse, SessionState]:
+def _advance_to_date(state, report, customer_message):
+    """Route a chosen leaf report to its date-input step."""
     di = report.get("date_input", "fy_picker")
+    cd = state.collected_data
+
+    if di == "unavailable":
+        return _resp(state, _msg_unavailable(report["name"]), _END_QR, "session_end_response",
+                     customer_message, status="ok")
+
+    if di == "cml_direct":
+        # CML: no picker — acknowledge and submit (last 1 year → today).
+        today = date.today()
+        start = (today - timedelta(days=365)).strftime("%d-%m-%Y")
+        end = today.strftime("%d-%m-%Y")
+        # Show the CML-specific ack regardless of downstream (fire-and-forget).
+        from src.gateways.statement_api import request_statement_fireandforget
+        try:
+            request_statement_fireandforget(
+                sub_account_id=state.sub_account_id or "", api_jobname=report["jobname"],
+                endpoint=report["endpoint"], start_date=start, end_date=end)
+        except Exception as exc:
+            logger.warning("[STATEMENT] CML submit failed: %s", exc)
+        return _resp(state, _msg_cml_ack(), _END_QR, "session_end_response", customer_message)
 
     if di == "fy_picker":
-        fy_opts = _financial_years()
-        reply = _msg_fy()
-        hist  = _save_hist(state, customer_message, reply)
-        ns = state.model_copy(update={"flow_state": "date_range_fy", "history": hist})
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=reply,
-                quick_reply_options=fy_opts,
-                flow_state="date_range_fy",
-                status="ok",
-            ),
-            ns,
-        )
+        return _resp(state, _msg_fy(), _financial_years(), "date_range_fy", customer_message)
 
-    if di == "as_on_date":
+    if di in ("segment_then_fy", "segment_then_range"):
+        return _resp(state, _msg_segment(), SEGMENTS, "segment_select", customer_message)
+
+    if di == "single_date":
         today_str = date.today().strftime("%d-%m-%Y")
-        reply = _msg_aod(today_str)
-        hist  = _save_hist(state, customer_message, reply)
-        ns = state.model_copy(update={"flow_state": "date_range_aod", "history": hist})
-        save_session(state.conversation_id, ns)
-        return (
-            InternalMessageResponse(
-                reply_message=reply,
-                quick_reply_options=[today_str],
-                flow_state="date_range_aod",
-                status="ok",
-            ),
-            ns,
-        )
+        return _resp(state, _msg_single_date(today_str), [today_str], "single_date", customer_message)
 
-    # month_picker
-    reply = _msg_month_year()
-    hist  = _save_hist(state, customer_message, reply)
-    ns = state.model_copy(update={"flow_state": "date_range_month", "history": hist})
-    save_session(state.conversation_id, ns)
-    return (
-        InternalMessageResponse(
-            reply_message=reply,
-            quick_reply_options=YEAR_OPTIONS,
-            flow_state="date_range_month",
-            status="ok",
-        ),
-        ns,
-    )
+    if di == "date_range_30":
+        return _resp(state, _msg_range(), [], "date_range_30", customer_message)
+
+    # month_picker (default)
+    return _resp(state, _msg_month_year(), YEAR_OPTIONS, "date_range_month", customer_message)

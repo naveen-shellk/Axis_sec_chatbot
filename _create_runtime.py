@@ -31,9 +31,12 @@ def main():
     role_arn     = sys.argv[5]
     web_token    = sys.argv[6]
 
-    gateway_url = (
-        f"https://asl-aws-dev-orion-bot-agentcore-gateway-pgywge4cf0"
-        f".gateway.bedrock-agentcore.{region}.amazonaws.com/mcp"
+    # New gateway in the DEPLOYED account (106611079163), created via
+    # create_gateway.py, with the ngrok tools target. Overridable via env.
+    _gateway_id = os.getenv("AGENTCORE_GATEWAY_ID", "asl-web-chatbot-gateway-y9c3ekf6p8")
+    gateway_url = os.getenv(
+        "AGENTCORE_GATEWAY_URL",
+        f"https://{_gateway_id}.gateway.bedrock-agentcore.{region}.amazonaws.com/mcp",
     )
 
     memory_id       = os.getenv("AGENTCORE_MEMORY_ID", "asl_web_chatbot_memory-HOlLFy7mrf")
@@ -50,19 +53,23 @@ def main():
         "INTENT_MODEL_ID":       "anthropic.claude-3-haiku-20240307-v1:0",
         "RESPONSE_MODEL_ID":     "qwen.qwen3-235b-a22b-2507-v1:0",
         "AGENTCORE_GATEWAY_URL": gateway_url,
+        # Gateway OFF — tool calls go DIRECTLY to the ngrok tools proxy instead
+        # (runtime → ngrok → proxy → internal API). The gateway path had opaque
+        # invocation failures; direct proxy is simpler and reliable for the demo.
+        "ENABLE_AGENTCORE_GATEWAY": os.getenv("ENABLE_AGENTCORE_GATEWAY", "false"),
+        "TOOLS_PROXY_URL":  os.getenv("TOOLS_PROXY_URL", ""),
+        "TOOLS_PROXY_KEY":  os.getenv("TOOLS_PROXY_KEY", ""),
+        # Memory uses the runtime's IAM role (non-expiring) — NOT static creds.
+        "USE_IAM_ROLE_FOR_MEMORY": "true",
         "WEB_API_TOKEN":         web_token,
         "LOG_LEVEL":             "INFO",
         "ENVIRONMENT":           "uat",
     }
 
-    mem_key = os.getenv("MEMORY_AWS_ACCESS_KEY_ID")
-    mem_sec = os.getenv("MEMORY_AWS_SECRET_ACCESS_KEY")
-    mem_tok = os.getenv("MEMORY_AWS_SESSION_TOKEN")
-    if mem_key and mem_sec:
-        env_vars["MEMORY_AWS_ACCESS_KEY_ID"] = mem_key
-        env_vars["MEMORY_AWS_SECRET_ACCESS_KEY"] = mem_sec
-        if mem_tok:
-            env_vars["MEMORY_AWS_SESSION_TOKEN"] = mem_tok
+    # NOTE: We deliberately do NOT bake MEMORY_AWS_* into the runtime env anymore.
+    # The container uses its IAM execution role (AslWebChatbotRuntimeRole) for
+    # AgentCore Memory via IMDS, which never expires. This eliminates the
+    # recurring "ExpiredTokenException → memory drops out" failure.
 
     # chatbot_web only handles pre-login flows — no private API calls needed.
     # PUBLIC mode is sufficient. Switch to VPC later if private APIs are added.

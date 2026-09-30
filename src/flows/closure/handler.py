@@ -98,6 +98,9 @@ _ALREADY_CLOSED_PHRASES = (
     "demat and trading account",
     "permanently closed",
 )
+# Only GENUINE "a request already exists" signals. NOTE: "request created
+# successfully" and "closure processed" are NEW-request responses (the API just
+# created one) — they must NOT be treated as in-progress.
 _IN_PROGRESS_PHRASES = (
     "already in process",
     "already created",
@@ -105,8 +108,7 @@ _IN_PROGRESS_PHRASES = (
     "under process",
     "closure is in process",
     "in progress",
-    "closure processed",
-    "request created successfully",
+    "duplicate",
 )
 
 # ── LLM system prompt for Message 1 (new_request only) ───────────────────────
@@ -274,7 +276,7 @@ def _call_closure_api(
                 sub_account_id, closure_type)
     # Route through the Strands agent; fall back to the direct gateway call.
     try:
-        from src.core.strands_agent import run_tool
+        from src.core.langchain_agent import run_tool
         out = run_tool(
             "create_account_closure",
             sub_account_id=sub_account_id,
@@ -321,23 +323,56 @@ def handle_closure(
         trading = sub_id
         email   = ""
 
+        account_status = "active"
         if sub_id:
             try:
-                from src.core.strands_agent import get_profile
+                from src.core.langchain_agent import get_profile
                 profile = get_profile(sub_id)
                 name    = profile.name or sub_id
                 demat   = profile.demat_account_no or sub_id
                 trading = profile.trading_account_no or sub_id
                 email   = profile.registered_email or ""
+                account_status = (profile.account_status or "active").lower()
             except Exception as exc:
                 logger.warning("[CLOSURE] profile fetch failed: %s", exc)
                 name = sub_id
+
+        # ── Spec step 1: CHECK ACCOUNT STATUS from the profile FIRST ──────────
+        # A purged/closed account is already closed — short-circuit here and do
+        # NOT call the closure API (which would create a request). Mirrors the
+        # email automation (accountStatus "P" = purged). A merely "deactivated"
+        # account is NOT closed, so it still proceeds to the closure request.
+        if account_status in ("purged", "closed"):
+            msg = _msg_already_closed(name, demat, trading)
+            hist = state.history + [
+                {"role": "user",      "content": customer_message},
+                {"role": "assistant", "content": msg},
+            ]
+            collected = {**state.collected_data, "name": name, "demat": demat,
+                         "trading": trading, "scenario": "already_closed"}
+            ns = state.model_copy(update={
+                "flow": "closure", "flow_state": "session_end_response",
+                "collected_data": collected, "history": hist,
+            })
+            save_session(state.conversation_id, ns)
+            logger.info("[CLOSURE] conv=%s sub=%s account_status=%s → already closed (no API call)",
+                        state.conversation_id, sub_id, account_status)
+            return (
+                InternalMessageResponse(
+                    reply_message=msg,
+                    quick_reply_options=["Go back to main menu", "End Chat"],
+                    flow_state="session_end_response", status="ok",
+                ), ns,
+            )
 
         # Infer the account type the customer wants to close from their message
         # (e.g. "close my trading account" → trading). Mirrors email automation.
         closure_type = _detect_closure_type(customer_message)
         logger.info("[CLOSURE] conv=%s detected closure_type=%s", state.conversation_id, closure_type)
 
+        # ── Spec step 2: CHECK CLOSURE REQUEST STATUS ────────────────────────
+        # Active account: call the closure API once. Its reason tells us whether
+        # a request is ALREADY in progress vs a genuinely new request.
         api_result = _call_closure_api(sub_id, email, name, closure_type=closure_type)
         scenario   = _detect_scenario(api_result)
 

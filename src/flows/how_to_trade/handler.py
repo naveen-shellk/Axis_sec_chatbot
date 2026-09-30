@@ -125,9 +125,12 @@ def _llm(state: SessionState, msg: str, bd: dict, system: str, next_fs: str) -> 
 
 
 def _match(text: str, options: list[str]) -> str | None:
+    # EXACT match only (button tap / verbatim option). Non-exact typed input is
+    # left for the LLM (_llm via run_conversation_turn) — no substring guessing,
+    # per the rule "exact predefined match → programmatic; everything else → LLM".
     tl = text.strip().lower()
     for opt in options:
-        if opt.lower() in tl or tl in opt.lower():
+        if opt.lower() == tl:
             return opt
     return None
 

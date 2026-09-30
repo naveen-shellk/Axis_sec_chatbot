@@ -25,9 +25,10 @@ def send_order_history_email(
     sub_account_id: str,
     segment_label:  str,
     date_str:       str,
+    end_date:       str = "",
 ) -> dict[str, Any]:
     """Send order history email via AgentCore Gateway."""
-    return _gw_order_email(sub_account_id, segment_label, date_str)
+    return _gw_order_email(sub_account_id, segment_label, date_str, end_date)
 
 
 __all__ = [

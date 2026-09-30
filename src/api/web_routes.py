@@ -177,7 +177,12 @@ def _build_quick_replies(
     reference: str = "",
 ) -> QuickReplies | None:
     """Build quickReplies object in exact Simcomm format."""
+    # Date-range / picker steps carry NO button options but still need the
+    # reference so the UI can render a calendar picker instead of buttons.
+    _PICKER_STATES = {"date_range_30", "dp_date_selection", "order_date_selection", "single_date"}
     if not options:
+        if reference in _PICKER_STATES:
+            return QuickReplies(reference=reference, options=[])
         return None
     seen = set()
     deduped = [o for o in options if o and not (o in seen or seen.add(o))]

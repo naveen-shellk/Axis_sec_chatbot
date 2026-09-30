@@ -39,6 +39,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.api.web_routes import router as web_router
 from src.api.internal_routes import router as internal_router
 from src.api.oauth_routes import router as oauth_router
+from src.api.auth_routes import router as auth_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -161,8 +162,79 @@ async def unhandled_exception_handler(request, exc):
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(oauth_router)        # POST /oauth/token (client_credentials)
+app.include_router(auth_router)         # POST /auth/send-otp, /auth/verify-otp (mock OTP)
 app.include_router(web_router)          # POST /api/chat  (public — Simcomm)
 app.include_router(internal_router)     # /internal/*     (dev only)
+
+
+# ── DEPLOYED runtime proxy (for the widget to hit the live AgentCore runtime) ──
+# A browser can't call invoke_agent_runtime (needs SigV4). This endpoint signs
+# and forwards to the DEPLOYED runtime, measures round-trip latency, and flags
+# the first-after-idle call as a likely cold start.
+import time as _time
+import json as _json
+from pydantic import BaseModel as _BaseModel
+
+_RUNTIME_ARN = os.getenv(
+    "AGENTCORE_RUNTIME_ARN",
+    "arn:aws:bedrock-agentcore:ap-south-1:106611079163:runtime/Asl_Web_chatbot_runtime-ev3kF2E2bY",
+)
+_RUNTIME_REGION = os.getenv("AWS_REGION", "ap-south-1")
+
+# Track last-invoke time to flag cold starts (idle gap → likely cold container).
+_last_invoke_ts = {"t": 0.0}
+_COLD_IDLE_SECONDS = float(os.getenv("COLD_IDLE_SECONDS", "300"))  # 5 min idle → treat as cold
+
+
+class _RemoteChatReq(_BaseModel):
+    Conversationid: str
+    Message: str
+    Event: str = "Incoming message"
+    Channel: str = "WEB"
+
+
+@app.post("/remote/chat", tags=["Deployed Runtime Proxy"],
+          summary="Forward to the deployed AgentCore runtime with latency timing")
+def remote_chat(body: _RemoteChatReq):
+    import boto3
+    now = _time.time()
+    gap = now - _last_invoke_ts["t"] if _last_invoke_ts["t"] else None
+    likely_cold = (_last_invoke_ts["t"] == 0.0) or (gap is not None and gap > _COLD_IDLE_SECONDS)
+
+    client = boto3.client("bedrock-agentcore", region_name=_RUNTIME_REGION)
+    payload = _json.dumps({
+        "Conversationid": body.Conversationid,
+        "Message":        body.Message,
+        "Event":          body.Event,
+        "Channel":        body.Channel,
+    }).encode("utf-8")
+
+    t0 = _time.perf_counter()
+    try:
+        resp = client.invoke_agent_runtime(
+            agentRuntimeArn=_RUNTIME_ARN,
+            contentType="application/json",
+            accept="application/json",
+            payload=payload,
+        )
+        raw = resp.get("response") or resp.get("output") or resp.get("payload") or b"{}"
+        if hasattr(raw, "read"):
+            raw = raw.read()
+        latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+        data = _json.loads(raw)
+    except Exception as exc:
+        logging.exception("remote_chat error")
+        return JSONResponse(status_code=502, content={"detail": f"runtime error: {exc}"})
+
+    _last_invoke_ts["t"] = _time.time()
+
+    # Attach timing metadata for the widget to display.
+    data["_timing"] = {
+        "latency_ms":    latency_ms,
+        "likely_cold":   likely_cold,
+        "idle_gap_sec":  round(gap, 1) if gap is not None else None,
+    }
+    return JSONResponse(content=data)
 
 
 # ── Startup: warm the AgentCore Memory clients ────────────────────────────────
@@ -176,7 +248,7 @@ def _warmup_memory():
     except Exception as exc:
         logging.warning("memory warmup skipped: %s", exc)
     try:
-        from src.core.strands_agent import warmup as _agent_warmup
+        from src.core.langchain_agent import warmup as _agent_warmup
         _agent_warmup()
     except Exception as exc:
         logging.warning("agent warmup skipped: %s", exc)

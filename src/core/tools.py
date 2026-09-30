@@ -1,7 +1,23 @@
 """
-chatbot_web/src/core/tools.py
-------------------------------
-Strands @tool definitions for the web channel chatbot.
+chatbot_langchain/src/core/tools.py
+------------------------------------
+Tool definitions for the web channel chatbot — LangChain variant.
+
+This is the LangChain port of chatbot_web/src/core/tools.py. The tool BODIES are
+byte-for-byte identical (same gateway wiring); only the framework binding differs:
+
+  chatbot_web (Strands):   functions decorated with `@tool` from `strands`.
+  chatbot_langchain:       plain Python functions, wrapped as LangChain
+                           StructuredTools for the agent, PLUS a name→callable
+                           registry so run_tool() can invoke them directly.
+
+Why plain functions + StructuredTool wrappers:
+  - The deterministic flows call run_tool("name", **kwargs) and expect a plain
+    dict back. Keeping the raw Python functions makes that a direct, reliable
+    call (no framework result-unwrapping needed).
+  - The fully-agentic path (run_agent_turn) needs LangChain-native tools to bind
+    to the model; those are built from the same functions via
+    StructuredTool.from_function, so the LLM sees identical names + docstrings.
 
 Tool auth summary:
   NO AUTH (noauth / header-only):
@@ -13,22 +29,14 @@ Tool auth summary:
 
   BASIC AUTH (REPORTS_USERNAME / REPORTS_PASSWORD):
     - request_statement          — Reports API
-    - request_statement_reports  — Reports API
     - get_ledger_balance         — Reports API
     - send_dp_bill               — Reports API
 
-Initialization:
-  The Strands Agent is instantiated once in strands_agent.py with BedrockModel (Qwen).
-  Tools decorated with @tool are passed to Agent(tools=[...]) at startup.
-  The agent uses tool docstrings to decide when and how to call each tool.
-  Flow handlers call helper functions in strands_agent.py (not the agent directly)
-  to keep tool invocations simple and testable.
-
 AgentCore deployment:
-  When running inside AgentCore Runtime, credentials come from the IAM execution role
-  (no explicit AWS keys needed). The BedrockModel uses the runtime's IAM role.
-  The same tools work in local dev (with explicit keys in .env) and in production
-  (with IAM role — keys not needed).
+  When running inside AgentCore Runtime, credentials come from the IAM execution
+  role (no explicit AWS keys needed). ChatBedrockConverse uses the runtime's IAM
+  role. The same tools work in local dev (with explicit keys in .env) and in
+  production (with IAM role — keys not needed).
 """
 
 from __future__ import annotations
@@ -36,16 +44,41 @@ from __future__ import annotations
 import logging
 import os
 
-from strands import tool
+from langchain_core.tools import StructuredTool
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# AUTHENTICATION — signals the handler to start the OTP phone flow
+# =============================================================================
+
+def request_authentication(reason: str = "account action requires verification") -> dict:
+    """
+    Request that the customer verify their identity before an account-specific
+    action can proceed. Call this WHENEVER the customer asks for something that
+    needs their account (statement, order status, account details, brokerage,
+    login help, account closure, IPO) AND you have not been given a verified
+    Sub-Account ID in the context.
+
+    Do NOT ask the customer for their account number yourself — call this tool
+    and the system will run secure OTP verification (mobile number → OTP) and
+    resolve the account for you.
+
+    Args:
+        reason: Brief reason authentication is needed (e.g. "view statement").
+
+    Returns:
+        {"auth_required": True, "reason": str}
+    """
+    logger.info("[TOOL] request_authentication: %s", reason)
+    return {"auth_required": True, "reason": reason}
 
 
 # =============================================================================
 # ESCALATION — no external call
 # =============================================================================
 
-@tool
 def escalate_to_agent(reason: str) -> dict:
     """
     Escalate the conversation to a live human agent via Webex Contact Center (WxCC).
@@ -71,7 +104,6 @@ def escalate_to_agent(reason: str) -> dict:
 # CUSTOMER INFO — X-tracking headers only (no secret auth)
 # =============================================================================
 
-@tool
 def get_account_status(sub_account_id: str) -> dict:
     """
     Check whether the customer's trading account is active, deactivated, or purged.
@@ -91,7 +123,6 @@ def get_account_status(sub_account_id: str) -> dict:
         return {"status": "active", "error": str(exc)}
 
 
-@tool
 def get_customer_profile(sub_account_id: str) -> dict:
     """
     Fetch full customer profile via AgentCore Gateway (customer-info-api___get_customer_profile).
@@ -119,7 +150,6 @@ def get_customer_profile(sub_account_id: str) -> dict:
         return {"error": str(exc), "account_status": "active"}
 
 
-@tool
 def get_customer_profile_full(sub_account_id: str) -> dict:
     """
     Fetch the COMPLETE customer profile as a serialisable dict, including every
@@ -152,7 +182,6 @@ def get_customer_profile_full(sub_account_id: str) -> dict:
         return {"error": str(exc), "account_status": "active", "raw": {}}
 
 
-@tool
 def create_account_closure(
     sub_account_id: str,
     email: str,
@@ -191,7 +220,6 @@ def create_account_closure(
 # STATEMENT / REPORTS — Basic Auth (REPORTS_USERNAME / REPORTS_PASSWORD)
 # =============================================================================
 
-@tool
 def request_statement(
     sub_account_id: str,
     report_name: str,
@@ -236,7 +264,6 @@ def request_statement(
         return {"success": False, "masked_email": "", "error": str(exc)}
 
 
-@tool
 def get_ledger_balance(
     sub_account_id: str,
     start_date: str,
@@ -271,7 +298,6 @@ def get_ledger_balance(
                 "emargin_balance": "0", "error": str(exc)}
 
 
-@tool
 def send_dp_bill(
     sub_account_id: str,
     start_date: str,
@@ -304,7 +330,6 @@ def send_dp_bill(
 # ORDER / TRADE BOOK — X-SubAccountID header only (no auth)
 # =============================================================================
 
-@tool
 def get_todays_orders(sub_account_id: str, segment: str) -> dict:
     """
     Fetch today's executed trades for a customer in the given market segment.
@@ -328,41 +353,44 @@ def get_todays_orders(sub_account_id: str, segment: str) -> dict:
         return {"found": False, "orders": [], "count": 0, "segment": segment, "error": str(exc)}
 
 
-@tool
 def send_order_history_email(
     sub_account_id: str,
     segment: str,
     date_str: str,
+    end_date: str = "",
 ) -> dict:
     """
-    Fetch order history for a specific date and send it to the customer's
+    Fetch order history for a date range and send it to the customer's
     registered email address. Used in the Order Status flow when the customer
-    selects Order History and picks a date.
+    selects Order History and picks a 30-day range.
 
     Auth: No authorization header required — noauth per API spec.
 
     Args:
         sub_account_id: Customer sub-account ID.
         segment:        Market segment — one of: "Equity", "Commodity", "Derivatives", "Mutual Funds".
-        date_str:       Date in DD-MM-YYYY format.
+        date_str:       Range start in DD-MM-YYYY format.
+        end_date:       Range end in DD-MM-YYYY (defaults to date_str for a single day).
 
     Returns:
         {"success": bool, "masked_email": str}
     """
     try:
         from src.gateways.order_api import send_order_history_email as _api
-        return _api(sub_account_id, segment, date_str)
+        return _api(sub_account_id, segment, date_str, end_date)
     except Exception as exc:
         logger.error("[TOOL] send_order_history_email failed: %s", exc)
         return {"success": False, "masked_email": "", "error": str(exc)}
 
 
 # =============================================================================
-# Tool registry — passed to Strands Agent at initialization
+# Registries
 # =============================================================================
 
-ALL_TOOLS = [
-    # No auth
+# Raw Python callables, by name — used by run_tool() for direct, reliable
+# invocation from the deterministic flows (no framework unwrapping needed).
+_RAW_FUNCS = [
+    request_authentication,
     escalate_to_agent,
     get_account_status,
     get_customer_profile,
@@ -370,8 +398,17 @@ ALL_TOOLS = [
     create_account_closure,
     get_todays_orders,
     send_order_history_email,
-    # Basic Auth (REPORTS_USERNAME / REPORTS_PASSWORD)
     request_statement,
     get_ledger_balance,
     send_dp_bill,
+]
+
+TOOL_FUNCS: dict = {fn.__name__: fn for fn in _RAW_FUNCS}
+
+# LangChain-native tools (StructuredTool) built from the same functions — used
+# by the fully-agentic path to bind to the model. Names + docstrings are taken
+# from the functions, so the LLM sees the identical tool surface as Strands.
+ALL_TOOLS = [
+    StructuredTool.from_function(fn, name=fn.__name__, description=(fn.__doc__ or "").strip())
+    for fn in _RAW_FUNCS
 ]

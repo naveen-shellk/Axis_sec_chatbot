@@ -34,15 +34,28 @@ class SessionState(BaseModel):
     customer_email: str | None = None     # used in response customer object
     customer_phone: str | None = None     # used in response customer object
 
+    # ── Authentication (mock phone-based OTP) ──────────────────────────────
+    # The customer authenticates with their registered mobile number. On a
+    # verified OTP the backend resolves the Sub-Account ID from the number and
+    # flips authenticated=True. Auth-required flows check this flag (not just
+    # the presence of sub_account_id). Persists for the life of the session.
+    authenticated:       bool = False
+    auth_phone:          str | None = None   # the mobile number that passed OTP
+    auth_sub_account_id: str | None = None   # the resolved ID after verification
+
     # ── Flow routing ──────────────────────────────────────────────────────
     flow: Literal[
         "bank_query", "how_to_trade", "need_more_help", "edit_profile",
         "statement", "ipo", "account_details", "brokerage", "login_query",
         "order_status", "closure",
-        # Transient state used by the entry handler while collecting the
-        # Sub-Account ID inline. Must be allowed here so the session can
+        # Transient states used by the entry handler while collecting the
+        # registered phone / OTP inline. Must be allowed here so the session can
         # round-trip through AgentCore Memory (which re-validates on read).
+        # awaiting_sub_account_id is kept for backward-compat with any in-flight
+        # sessions; the active auth path now uses awaiting_phone.
         "awaiting_sub_account_id",
+        "awaiting_phone",
+        "awaiting_otp",
     ] | None = None
     flow_state: str = "start"
 

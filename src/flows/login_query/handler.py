@@ -105,7 +105,7 @@ def handle_login_query(state: SessionState, customer_message: str) -> tuple[Inte
     fs = state.flow_state
 
     if fs == "start":
-        from src.core.strands_agent import get_profile
+        from src.core.langchain_agent import get_profile
         _ERROR_MSG = (
             "We were unable to retrieve your account information at this time.\n\n"
             "Please try again later or contact support: 📞 022-40508080 / 022-61480808"
@@ -148,58 +148,33 @@ def handle_login_query(state: SessionState, customer_message: str) -> tuple[Inte
                                                 quick_reply_options=["Go back to main menu", "End Chat"],
                                                 flow_state="session_end_response", status="ok"), ns)
             else:
-                # Escalate codes or unknown deact code → direct live agent (no confirmation)
-                from src.flows.need_more_help.handler import _is_business_hours
+                # Deactivation code NOT found in table 1 (unknown code like D001,
+                # or an escalate-list code). Per the chatbot Login Query flow spec,
+                # this branch simply shows a create-ticket link — NO live-agent
+                # escalation and NO business-hours split.
                 import os as _os
-                if _is_business_hours():
-                    _ESCALATE_MSG = (
-                        "Your account requires manual review by our support team.\n\n"
-                        "Let me connect you to a customer service representative "
-                        "who will assist you with your account issue. Please hold on."
-                    )
-                    hist = state.history + [
-                        {"role": "user",      "content": customer_message},
-                        {"role": "assistant", "content": _ESCALATE_MSG},
-                    ]
-                    ns = state.model_copy(update={
-                        "flow_state": "escalated",
-                        "escalate":   True,
-                        "history":    hist,
-                    })
-                    save_session(state.conversation_id, ns)
-                    logger.info("[LOGIN_QUERY] conv=%s deact_code=%r → escalating (within hours)",
-                                state.conversation_id, deact_code)
-                    return (InternalMessageResponse(
-                        reply_message=_ESCALATE_MSG,
-                        quick_reply_options=[],
-                        flow_state="escalated",
-                        status="escalate",
-                        eventid="1002",
-                    ), ns)
-                else:
-                    _ticket = _os.getenv(
-                        "SUPPORT_TICKET_URL",
-                        "https://simplehai.axisdirect.in/portal/index.php/supportPortal/raise-query",
-                    )
-                    _OOH_MSG = (
-                        "Your account issue requires manual review by our support team.\n\n"
-                        "Our live agents are available Monday to Friday, 9:00 AM – 6:00 PM IST.\n"
-                        f"Please raise a support ticket: 🎫 {_ticket}"
-                    )
-                    hist = state.history + [
-                        {"role": "user",      "content": customer_message},
-                        {"role": "assistant", "content": _OOH_MSG},
-                    ]
-                    ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
-                    save_session(state.conversation_id, ns)
-                    logger.info("[LOGIN_QUERY] conv=%s deact_code=%r → out of hours ticket",
-                                state.conversation_id, deact_code)
-                    return (InternalMessageResponse(
-                        reply_message=_OOH_MSG,
-                        quick_reply_options=["Go back to main menu", "End Chat"],
-                        flow_state="session_end_response",
-                        status="ok",
-                    ), ns)
+                _ticket = _os.getenv(
+                    "SUPPORT_TICKET_URL",
+                    "https://simplehai.axisdirect.in/portal/index.php/supportPortal/raise-query",
+                )
+                _TICKET_MSG = (
+                    "Your account requires manual review by our support team.\n\n"
+                    f"Please raise a support ticket here and our team will assist you: 🎫 {_ticket}"
+                )
+                hist = state.history + [
+                    {"role": "user",      "content": customer_message},
+                    {"role": "assistant", "content": _TICKET_MSG},
+                ]
+                ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
+                save_session(state.conversation_id, ns)
+                logger.info("[LOGIN_QUERY] conv=%s deact_code=%r → ticket link (not in table 1)",
+                            state.conversation_id, deact_code)
+                return (InternalMessageResponse(
+                    reply_message=_TICKET_MSG,
+                    quick_reply_options=["Go back to main menu", "End Chat"],
+                    flow_state="session_end_response",
+                    status="ok",
+                ), ns)
 
         ns = state.model_copy(update={"flow_state": "session_end_response", "history": hist})
         save_session(state.conversation_id, ns)

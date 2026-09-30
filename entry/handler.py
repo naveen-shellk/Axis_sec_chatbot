@@ -1,17 +1,14 @@
 """
 chatbot_langchain/entry/handler.py
 ----------------------------------
-Single entry point — HYBRID router.
+Single entry point — deterministic flow router.
 
-Default (AGENTIC_MODE=false): deterministic flow state-machines handle every
-turn — greeting menu, intent classification, and the per-flow step logic
-(statement date pickers, closure confirmation, order segments, etc.) with their
-static messages and quick replies. This matches the documented flowcharts.
+Deterministic flow state-machines handle every turn — greeting menu, intent
+classification, and the per-flow step logic (statement date pickers, closure
+confirmation, order segments, etc.) with their static messages and quick
+replies. This matches the documented flowcharts.
 
-Opt-in (AGENTIC_MODE=true): the whole turn is handed to the LLM agent
-(_handle_agentic), which decides tools itself. Kept for experimentation.
-
-Authentication (both modes): account-required flows are gated behind a secure
+Authentication: account-required flows are gated behind a secure
 mock OTP phone flow. When such a flow is requested and the session is not yet
 authenticated, we ask for the registered mobile number → send OTP → verify →
 the backend resolves the Sub-Account ID from the number → the pending flow
@@ -171,10 +168,6 @@ def handle_message(
             "auth_sub_account_id": sub_account_id,
         })
         save_session(conversation_id, state)
-
-    # ── Opt-in fully-agentic mode ─────────────────────────────────────────────
-    if os.getenv("AGENTIC_MODE", "false").lower() == "true":
-        return _handle_agentic(state, raw_input, conversation_id)
 
     # ── Global "End Chat" — works from ANY flow state ─────────────────────────
     _GLOBAL_END_PHRASES = {"end chat", "endchat", "end the chat", "end conversation"}
@@ -647,53 +640,4 @@ def _dispatch_pending_intent(state: SessionState, raw_input: str, pending: list[
     return InternalMessageResponse(
         reply_message="How else can I help you?", quick_reply_options=_FULL_MENU,
         flow_state="main_menu", status="ok",
-    )
-
-
-# ── Opt-in agentic path (AGENTIC_MODE=true) ───────────────────────────────────
-
-def _handle_agentic(state: SessionState, raw_input: str, conversation_id: str) -> InternalMessageResponse:
-    """Fully-agentic turn: the LLM agent decides which tools to call. Opt-in."""
-    from src.core.langchain_agent import run_agent_turn
-
-    recent = state.history[-6:]
-    convo  = "\n".join(
-        f"{'Customer' if h.get('role')=='user' else 'Assistant'}: {h.get('content','')}"
-        for h in recent if h.get("content")
-    )
-    if state.authenticated and state.sub_account_id:
-        sub_line = (f"AUTH STATUS: verified. Customer Sub-Account ID: {state.sub_account_id} "
-                    f"(use this for account actions; never invent one).")
-    else:
-        sub_line = ("AUTH STATUS: NOT verified — no Sub-Account ID. For any account-specific "
-                    "action, call request_authentication (do NOT ask for the number, do NOT call account tools).")
-    prompt = (f"{sub_line}\n\nConversation so far:\n{convo or '(none)'}\n\n"
-              f"Customer's latest message: {raw_input}\n\n"
-              f"Decide what to do (call tools as needed) and reply to the customer.")
-
-    result = run_agent_turn(prompt)
-    if result.get("needs_auth"):
-        st = state.model_copy(update={"collected_data": {**state.collected_data, "pending_request": raw_input}})
-        return _start_phone_auth(st, raw_input, conversation_id, pending_intent=None)
-
-    message  = result.get("message") or "I'm sorry, I couldn't process that. Please try again."
-    escalate = bool(result.get("escalate"))
-    qset = (result.get("quick_reply_set") or "").strip()
-    _sets = {"main_menu": _FULL_MENU, "session_end": _FOLLOWUP_REPLIES}
-    quick_replies = _sets.get(qset, list(_FOLLOWUP_REPLIES))
-
-    save_session(conversation_id, state.model_copy(update={
-        "history": state.history + [
-            {"role": "user", "content": raw_input},
-            {"role": "assistant", "content": message},
-        ],
-    }))
-    if escalate:
-        return InternalMessageResponse(
-            reply_message=message, quick_reply_options=[],
-            flow_state="escalated", status="escalate", eventid="1002",
-        )
-    return InternalMessageResponse(
-        reply_message=message, quick_reply_options=quick_replies,
-        flow_state="agentic", status="ok", eventid="1001",
     )

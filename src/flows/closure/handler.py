@@ -67,7 +67,6 @@ from __future__ import annotations
 import logging
 import os
 
-from src.core.conversation import run_conversation_turn
 from src.core.session_store import save_session
 from src.shared.session_end import handle_session_end
 from models import InternalMessageResponse, SessionState
@@ -436,18 +435,14 @@ def handle_closure(
                 ns,
             )
 
-        # ── New request — Message 1 via Qwen LLM ─────────────────────────────
-        resp = run_conversation_turn(
-            state_data={"flow": "closure", "flow_state": "new_request_msg1"},
-            history=state.history,
-            customer_message=customer_message,
-            backend_data={
-                "customer_name": name,
-                "features_url":  _FEATURES_URL,
-            },
-            system_override=_MSG1_SYS,
-        )
-        msg1 = resp.get("message", _msg_new_request_1_fallback(name))
+        # ── New request — Message 1 (hardcoded) ──────────────────────────────
+        # Message 1 is a fixed empathetic retention line (name + features link +
+        # "anything we can do"). It carries no account data and the wording is
+        # effectively static, so we build it directly instead of paying a ~2-4s
+        # Qwen call on every closure start. This is the single biggest latency
+        # win for this flow (closure start already does profile + closure-API
+        # HTTP calls). The old Qwen path produced the same message.
+        msg1 = _msg_new_request_1_fallback(name)
 
         hist = state.history + [
             {"role": "user",      "content": customer_message},

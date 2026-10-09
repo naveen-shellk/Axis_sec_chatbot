@@ -73,7 +73,11 @@ def _proxy_call(endpoint: str, body: dict) -> dict:
     if _TOOLS_PROXY_KEY:
         headers["X-Proxy-Key"] = _TOOLS_PROXY_KEY
     logger.info("[PROXY] POST %s", url)
-    resp = _requests.post(url, json=body, headers=headers, timeout=30)
+    # Read timeout is configurable (TOOLS_PROXY_TIMEOUT, default 90s). The internal
+    # UAT APIs can be slow (observed ~45s for a profile fetch); a 30s timeout made
+    # the runtime give up and retry in a loop. Connect timeout stays short (10s).
+    _read_to = float(os.getenv("TOOLS_PROXY_TIMEOUT", "90"))
+    resp = _requests.post(url, json=body, headers=headers, timeout=(10, _read_to))
     resp.raise_for_status()
     return resp.json()
 
@@ -121,6 +125,7 @@ _REPORT_ROUTING: dict[str, tuple[str, str]] = {
     "bill":                             ("statements/send-mail", "Bill"),
     "equity margin":                    ("statements/send-mail", "EquityMargin"),
     "equitymargin":                     ("statements/send-mail", "EquityMargin"),
+    "equity daily margin":              ("statements/send-mail", "EquityMargin"),
     "commodity contract note physical": ("statements/send-mail", "CommodityContractNotesPhysical"),
     "derivative physical bill":         ("statements/send-mail", "DerivativePhysicalBills"),
     "retention statement":              ("statements/send-mail", "RetentionStatement"),
@@ -255,7 +260,9 @@ def get_customer_profile(sub_account_id: str) -> dict[str, Any]:
     try:
         raw = call_tool(
             "customer-info-api___get_customer_profile",
-            {"X-SubAccountID": sub_account_id, "X-Source": "ChatBot", "X-SourceChannel": "Web"},
+            # thor v6.1 passes subAccountId in the body; keep the X- headers too.
+            {"subAccountId": sub_account_id,
+             "X-SubAccountID": sub_account_id, "X-Source": "ChatBot", "X-SourceChannel": "Web"},
         )
         if not _is_vpc_error(raw):
             data = raw.get("data", raw) if isinstance(raw, dict) else raw
@@ -356,32 +363,50 @@ def _call_statement_gateway(sub_account_id, report_name, start_date, end_date,
             "startDate":        _to_iso(start_date),
             "endDate":          _to_iso(end_date),
             "fileType":         "xlsx",
-            "downloadTypeFlag": "E",
+            # thor v6.1 + the verified direct-HTTP path both use "D" (not "E").
+            "downloadTypeFlag": "D",
             "source":           "chat-bot",
             "dpaccountno":      dp_account_no,
             "holdingType":      "All",
         })
     if endpoint == "sendmail":
+        # Aligned to thor v6.1 statements.py comtrack working contract:
+        # camelCase customerId/startDate/endDate/requestType.
+        # NOTE: this GATEWAY-path field is "dp_id" to match thor's deployed
+        # Gateway OpenAPI target (cdk/tools/openapi/*/statement_api.json defines
+        # "dp_id"). The DIRECT-HTTP path below uses "dpId" because the LIVE UAT
+        # Reports API rejects "dp_id" (400 "dp_id is required") and only accepts
+        # "dpId" — thor's OpenAPI spec is stale vs the live API for DP reports.
+        # If the gateway target is ever refreshed to "dpId", align this too.
+        # Tool name stays *-v2 (the deployed Gateway target is statement-api-v2).
         return call_tool("statement-api-v2___request_statement_comtrack", {
-            "X-SubAccountId": sub_account_id,
-            "customer_id":    sub_account_id,
-            "dp_id":          dp_account_no,
-            "start_date":     start_date,
-            "end_date":       end_date,
-            "jobname":        report_name,
-            "request_type":   "email",
+            "X-SubAccountId":  sub_account_id,
+            "X-Source":        "ChatBot",
+            "X-SourceChannel": "Web",
+            "customerId":      sub_account_id,
+            "dp_id":           dp_account_no,
+            "startDate":       start_date,
+            "endDate":         end_date,
+            "jobname":         report_name,
+            "requestType":     "email",
         })
-    # oneclick
-    return call_tool("statement-api-v2___request_statement_reports", {
+    # oneclick (send-mail style) — aligned to thor v6.1 comtrack camelCase fields.
+    # NOTE: thor's deployed statement-api-v2 target exposes only 5 operations:
+    # request_statement, request_statement_comtrack, track_statement,
+    # download_statement, get_ledger. There is NO request_statement_reports.
+    # The "oneclick"/send-mail style request is just another send-mail call, so
+    # route it through request_statement_comtrack (the real /statements/send-mail
+    # operation) to stay compatible with thor's gateway targets.
+    return call_tool("statement-api-v2___request_statement_comtrack", {
         "X-SubAccountId":  sub_account_id,
         "X-Source":        "ChatBot",
         "X-SourceChannel": "Web",
-        "customer_id":     sub_account_id,
+        "customerId":      sub_account_id,
         "dp_id":           dp_account_no,
-        "start_date":      start_date,
-        "end_date":        end_date,
+        "startDate":       start_date,
+        "endDate":         end_date,
         "jobname":         report_name,
-        "request_type":    "email",
+        "requestType":     "email",
     })
 
 
@@ -405,16 +430,25 @@ def _request_statement_direct(sub_account_id, report_name, start_date, end_date,
                                    or "dp" in canonical_name.lower()):
             try:
                 from src.gateways.customer_api import get_customer_profile as _cp
-                dp_account_no = _cp(sub_account_id).demat_account_no or ""
-                logger.info("[GW] request_statement resolved dp account from profile: %s",
+                _prof = _cp(sub_account_id)
+                # The Reports API send-mail "dpId" field wants the SHORT
+                # depository participant id (dpId, e.g. IN304295), NOT the full
+                # dpAccountNo. Prefer dp_id; fall back to the account number only
+                # if dp_id is unavailable.
+                dp_account_no = _prof.dp_id or _prof.demat_account_no or ""
+                logger.info("[GW] request_statement resolved dpId from profile: %s",
                             dp_account_no or "(none)")
             except Exception as exc:
-                logger.warning("[GW] request_statement could not resolve dp account: %s", exc)
+                logger.warning("[GW] request_statement could not resolve dpId: %s", exc)
 
         if endpoint_suffix == "statements/send-mail":
-            # send-mail expects all camelCase: customerId/dpId/startDate/endDate/
-            # requestType + jobname; dates DD-MM-YYYY. (Confirmed against the live
-            # UAT Reports API — the DP-account field must be "dpId", not "dp_id".)
+            # send-mail (comtrack): customerId + dpId + DD-MM-YYYY dates +
+            # jobname + requestType, with X-SubAccountId header + Basic auth.
+            # Field name MUST be camelCase "dpId" and the VALUE MUST be the SHORT
+            # depository participant id (profile dpAccountDetails[].dpId, e.g.
+            # IN304295) — resolved above from the customer profile. Verified live
+            # (A/B, identical request otherwise): "dp_id" -> 400 "dp_id is
+            # required"; "dpId" -> 404 "no documents" (= accepted, no data).
             url = f"{_REPORTS_API_BASE}/statements/send-mail"
             payload = {
                 "customerId":  sub_account_id,
@@ -588,6 +622,7 @@ _SEGMENT_MAP = {
     "Equity":       "EQ",
     "Commodity":    "COMM",
     "Derivatives":  "FO",
+    "Currency":     "CURR",
     "Mutual Funds": "MF",
 }
 
@@ -629,6 +664,14 @@ def _call_trade_book_direct(sub_account_id: str, segment: str) -> dict:
         if resp.status_code == 200:
             data = resp.json()
             return {"success": True, "data": data.get("data", []), "api_response": data}
+        # The Order/Trade-Book API returns HTTP 500 with error "no data found"
+        # (code 1633) when the account simply has NO trades — a DATA condition,
+        # NOT a server failure. Treat that as an empty-but-successful result so
+        # the flow says "no orders today" instead of "couldn't fetch".
+        body = (resp.text or "").lower()
+        if "no data found" in body or '"1633"' in body or "1633" in body:
+            logger.info("[GW] get_trade_book: 'no data found' → treating as empty (no orders)")
+            return {"success": True, "data": [], "api_response": {}}
         return {"success": False, "data": [], "error": f"HTTP {resp.status_code}"}
     except Exception as e:
         logger.error("[GW] get_trade_book direct HTTP failed: %s", e)
@@ -658,10 +701,17 @@ def get_todays_orders(sub_account_id: str, segment_label: str) -> dict[str, Any]
     if raw is None:
         raw = _call_trade_book_direct(sub_account_id, segment)
 
+    # Distinguish a genuine API FAILURE (success=False + error) from an empty
+    # result. Propagate `error` so the flow can show "couldn't fetch" rather
+    # than wrongly telling the customer "no orders today".
+    api_failed = isinstance(raw, dict) and raw.get("success") is False and raw.get("error")
     trades = raw.get("data", []) if isinstance(raw, dict) else []
     todays = _filter_today(trades) if isinstance(trades, list) else []
-    return {"found": bool(todays), "orders": todays,
-            "count": len(todays), "segment": segment_label}
+    result = {"found": bool(todays), "orders": todays,
+              "count": len(todays), "segment": segment_label}
+    if api_failed:
+        result["error"] = raw.get("error")
+    return result
 
 
 def send_order_history_email(sub_account_id: str, segment_label: str,
@@ -780,10 +830,16 @@ def _create_closure_direct(sub_account_id: str, email: str, name: str,
         }
         if dp_account_no:
             payload["dpAccountNo"] = dp_account_no
+        # thor v6.1 posts closure through _ileverage_post with Basic auth
+        # (ILEVERAGE_USERNAME/PASSWORD). Match that here.
+        auth = None
+        if _ILEVERAGE_USERNAME and _ILEVERAGE_PASSWORD:
+            auth = (_ILEVERAGE_USERNAME, _ILEVERAGE_PASSWORD)
         resp = _requests.post(
             _CLOSURE_URL,
             json=payload,
             headers={"Content-Type": "application/json"},
+            auth=auth,
             timeout=30,
         )
         logger.info("[GW] create_closure_request direct HTTP status=%d", resp.status_code)

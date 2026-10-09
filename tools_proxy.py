@@ -33,6 +33,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(__file__), "config", ".env"), override=True)
 
+# CRITICAL: this process IS the tools proxy. It must talk to the internal APIs
+# DIRECTLY, never through TOOLS_PROXY_URL — otherwise every request loops back
+# out through ngrok to this same proxy (proxy → ngrok → proxy → …) until it
+# times out (~45s) and only then falls through to direct. The shared config/.env
+# now sets TOOLS_PROXY_URL for the deployed runtime, so we must blank it HERE,
+# before gateway_client reads it at import time.
+os.environ["TOOLS_PROXY_URL"] = ""
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel

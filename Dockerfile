@@ -16,8 +16,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# --retries / --timeout make the build tolerant of slow or flaky PyPI reads.
+# Without these, a single 15s read timeout on one dependency (e.g.
+# charset-normalizer) makes pip backtrack through every version and fail with a
+# misleading "ResolutionImpossible" that is really just a network drop.
 RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir --prefix=/deps -r requirements.txt
+    && pip install --no-cache-dir --prefix=/deps \
+       --retries 10 --timeout 120 \
+       -r requirements.txt
 
 # ── Stage 2: runtime image ────────────────────────────────────────────────────
 FROM python:3.12-slim

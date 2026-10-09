@@ -113,10 +113,17 @@ class WebChatRequest(BaseModel):
     Event:          str = Field("Incoming message", description="Event type from Simcomm")
     Channel:        str = Field("WEB", description="Always WEB for this integration")
     timestamp:      str = Field("", description="ISO-8601 client timestamp")
+    # Client_ID == the customer's Sub-Account ID. When supplied, the backend
+    # treats the session as already identified for that account (post-login).
+    Client_ID:      str = Field("", description="Customer Sub-Account ID (identity)")
 
     @property
     def conversation_id(self) -> str:
         return self.Conversationid
+
+    @property
+    def client_id(self) -> str:
+        return self.Client_ID
 
     @property
     def message(self) -> str:
@@ -202,6 +209,31 @@ class WebEscalationResponse(BaseModel):
     customparam1:    str              = Field("")
     customer:        CustomerInfo     = Field(default_factory=CustomerInfo)
     context:         dict[str, str]   = Field(default_factory=dict)
+
+
+class WebEndChatRequest(BaseModel):
+    """
+    End-chat notification from Simcomm/WebX (POST /api/chat/end).
+
+    Matches the Postman contract:
+        {
+          "conversation_id": "CSR0122XNRRMENM4",
+          "Client_ID": "12345678",
+          "endedBy": "agent",
+          "resolution": "resolved",
+          "timestamp": "2026-08-13T09:24:10.000Z"
+        }
+    Best-effort — only conversation_id is required; the rest is metadata.
+    """
+    conversation_id: str = Field(..., description="Session ID of the chat to end")
+    Client_ID:       str = Field("", description="Customer Sub-Account ID (identity)")
+    endedBy:         str = Field("", description="Who ended the chat (agent/customer/system)")
+    resolution:      str = Field("", description="Resolution status, e.g. resolved")
+    timestamp:       str = Field("", description="ISO-8601 client timestamp")
+
+    @property
+    def client_id(self) -> str:
+        return self.Client_ID
 
 
 class WebEndChatAck(BaseModel):

@@ -30,8 +30,10 @@ class CustomerProfile:
     portal_status:        int   # 1 = FTL done, 0 = FTL pending
     deactivation_code:    str
     deactivation_reason:  str
-    demat_account_no:     str = ""   # primary DP account number
+    demat_account_no:     str = ""   # full DP account number (dpAccountNo, e.g. IN30429587539891) — display
+    dp_id:                str = ""   # short depository participant id (dpId, e.g. IN304295) — Reports API dpId field
     trading_account_no:   str = ""   # sub_account_id / trading ID
+    segments_enabled:     dict = field(default_factory=dict)  # profile segmentsEnabled (nseCash/nseFO/...)
     raw:                  dict = field(default_factory=dict)
 
 
@@ -59,13 +61,16 @@ def get_customer_profile(sub_account_id: str) -> CustomerProfile:
     # shapes used "mobileNo"/"phone". Accept any of them and stringify.
     phone          = str(raw.get("mobileNo") or raw.get("phoneNo") or raw.get("phone") or "").strip()
 
-    # Extract primary demat account number from dpAccountDetails
+    # Extract DP identifiers from dpAccountDetails (prefer the default DP, else
+    # the first). dpAccountNo = full account number (display); dpId = short
+    # depository participant id required by the Reports API send-mail "dpId".
     dp_accounts    = raw.get("dpAccountDetails") or []
     demat_no       = ""
+    dp_id          = ""
     if dp_accounts:
-        # prefer default DP, else first one
         default_dp = next((d for d in dp_accounts if d.get("dpDefault")), dp_accounts[0])
         demat_no   = default_dp.get("dpAccountNo") or default_dp.get("dpId") or ""
+        dp_id      = default_dp.get("dpId") or ""
 
     # Trading account = sub_account_id (parentTradingId)
     trading_no = raw.get("parentTradingId") or raw.get("subAccountId") or sub_account_id
@@ -81,7 +86,9 @@ def get_customer_profile(sub_account_id: str) -> CustomerProfile:
         deactivation_code   = deact_code,
         deactivation_reason = raw.get("deactivationReason") or "",
         demat_account_no    = demat_no,
+        dp_id               = dp_id,
         trading_account_no  = trading_no,
+        segments_enabled    = raw.get("segmentsEnabled") or {},
         raw                 = raw,
     )
 

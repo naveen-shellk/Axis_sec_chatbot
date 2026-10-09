@@ -81,7 +81,10 @@ REPORTS_BY_CATEGORY: dict[str, list[dict]] = {
             {"name": "Derivative Physical Bills",  "jobname": "DerivativePhysicalBills", "endpoint": "sendmail", "date_input": "date_range_30"},
         ]},
         {"name": "Daily Margin Report", "subtab": True, "reports": [
-            {"name": "Equity Daily Margin",    "jobname": "",                     "endpoint": "sendmail", "date_input": "unavailable"},
+            # Equity Daily Margin IS serviceable (thor: "equity margin" ->
+            # EquityMargin send-mail; prompt maps "equity daily margin / margin
+            # statement"). Emailed for a date range, like Commodity Daily Margin.
+            {"name": "Equity Daily Margin",    "jobname": "EquityMargin",         "endpoint": "sendmail", "date_input": "date_range_30"},
             {"name": "Commodity Daily Margin", "jobname": "CommodityDailyMargin", "endpoint": "sendmail", "date_input": "date_range_30"},
         ]},
         {"name": "Global Statement (Trade Summary)", "jobname": "AGTS",                 "endpoint": "sendmail", "date_input": "fy_picker"},
@@ -195,24 +198,28 @@ def _msg_reports(category: str) -> str:
 def _msg_subtab(name: str) -> str:
     return f"Please select a report under {name}:"
 
-def _msg_fy() -> str:
-    return "Please select the financial year."
+def _for(report_name: str) -> str:
+    """' for your <report>' suffix so date prompts say what they're generating."""
+    return f" for your {report_name}" if report_name else " for your statement"
 
-def _msg_segment() -> str:
-    return "Please select the segment."
+def _msg_fy(report_name: str = "") -> str:
+    return (f"Please select the financial year{_for(report_name)}.")
 
-def _msg_month_year() -> str:
-    return "Please select the desired year from below options to generate the statement."
+def _msg_segment(report_name: str = "") -> str:
+    return (f"Please select the market segment{_for(report_name)}.")
 
-def _msg_month_name() -> str:
-    return "Please select month from dropdown."
+def _msg_month_year(report_name: str = "") -> str:
+    return (f"Please select the year{_for(report_name)}.")
 
-def _msg_single_date(today_str: str) -> str:
-    return f"Please select a date (default: {today_str})."
+def _msg_month_name(report_name: str = "") -> str:
+    return (f"Please select the month{_for(report_name)}.")
 
-def _msg_range() -> str:
-    return ("Please select a date range within 30 days from the calendar "
-            "(DD-MM-YYYY to DD-MM-YYYY) to generate the statement.")
+def _msg_single_date(today_str: str, report_name: str = "") -> str:
+    return (f"Please select a date{_for(report_name)} (default: {today_str}).")
+
+def _msg_range(report_name: str = "") -> str:
+    return (f"Please select a date range within 30 days{_for(report_name)} "
+            "(DD-MM-YYYY to DD-MM-YYYY) from the calendar.")
 
 def _msg_range_wrong() -> str:
     return "Please choose a date range within the 30 days from your request."
@@ -272,6 +279,130 @@ def _extract(system: str, message: str, context: dict | None = None) -> dict:
     full = f"{ctx}\n\nCustomer message: {message}" if ctx else f"Customer message: {message}"
     result = call_intent_llm(system, [{"role": "user", "content": [{"text": full}]}])
     return result.get("parsed") or {}
+
+
+# ── Slot-filling: extract EVERY slot from a free-text message in one shot ──────
+# Lets the customer say e.g. "Tax Statement for 01-04-2018 to 31-03-2025 and
+# 01-04-2025 to 15-01-2026" and skip the step-by-step questions. Runs ONLY on
+# free text (gated in handle_statement) so button/picker taps stay instant.
+_ALL_REPORT_NAMES = [
+    r["name"]
+    for items in REPORTS_BY_CATEGORY.values()
+    for it in items
+    for r in (it["reports"] if it.get("subtab") else [it])
+]
+
+_EXTRACT_SLOTS_SYS = """\
+You extract statement-request details from an Axis Direct customer's message.
+
+Known report names (match loosely to the customer's wording, return the EXACT name):
+%s
+
+Market segments: Equity, Commodity, Derivatives, Currency
+
+Return JSON ONLY:
+{
+  "report_name": "<exact report name from the list, or null>",
+  "category": "Tax Reports | Demat Reports | Trading Reports | null",
+  "segment": "<segment or null>",
+  "ranges": [ {"start": "DD-MM-YYYY", "end": "DD-MM-YYYY"} ]
+}
+
+Rules:
+- Convert ANY date the customer gives into DD-MM-YYYY (e.g. "1st April 2018" -> "01-04-2018").
+- SCOPE: extract ONLY the report + the date period(s) the customer tied to THAT
+  STATEMENT/REPORT. If the message ALSO asks about other topics (order history,
+  charges, orders, holdings in another product), IGNORE the dates that belong to
+  those other topics — do NOT put them in "ranges". Example: "ledger statement
+  for FY 2024-25 and my order history for last month" -> report_name="Ledger
+  Report", ranges=[FY 2024-25 only]; the "last month" date is for order history,
+  NOT this statement, so EXCLUDE it.
+- "ranges" may contain MULTIPLE periods only if the customer asked for the SAME
+  report across several periods; [] if none.
+- Relative dates ("last month", "this financial year", "past 30 days") are
+  resolved RELATIVE TO TODAY (today's date is given in the message context).
+- NEVER HALLUCINATE DATES. Put a range in "ranges" ONLY when the customer gave
+  an EXPLICIT date/period (e.g. "01-04-2024 to 31-03-2025", "FY 2024-25",
+  "January 2026", "last month"). If the customer named NO period for this
+  report, return ranges = []. If a period is vague/unresolvable, return
+  ranges = []. When unsure, prefer [] over a guessed date. An empty ranges is
+  CORRECT and expected — the flow will then ask the customer for the dates.
+- Only fill a field if the customer actually implied it; otherwise null / [].
+- Do NOT invent dates, periods, reports, categories, or segments.
+""" % ("\n".join(f"  - {n}" for n in _ALL_REPORT_NAMES))
+
+
+def _norm_ddmmyyyy(s: str) -> str | None:
+    """Normalise a date string to DD-MM-YYYY, or None if unparseable."""
+    s = (s or "").strip()
+    m = re.search(r"\b(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b", s)
+    if m:
+        try:
+            d = date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+            return d.strftime("%d-%m-%Y")
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_slots(message: str) -> dict:
+    """One Haiku call -> all statement slots found in free text."""
+    _today = date.today().strftime("%d-%m-%Y")
+    parsed = _extract(_EXTRACT_SLOTS_SYS, message, {"today": _today}) or {}
+    out: dict = {}
+
+    rn = parsed.get("report_name")
+    if rn and _find_report(rn):
+        out["report_name"] = _find_report(rn)["name"]  # canonical casing
+
+    cat = parsed.get("category")
+    if cat in TOP_CATEGORIES:
+        out["category"] = cat
+
+    seg = parsed.get("segment")
+    if seg in SEGMENTS:
+        out["segment"] = seg
+
+    ranges = []
+    for r in (parsed.get("ranges") or []):
+        s = _norm_ddmmyyyy(str(r.get("start", "")))
+        e = _norm_ddmmyyyy(str(r.get("end", "")))
+        if s and e:
+            ds = datetime.strptime(s, "%d-%m-%Y").date()
+            de = datetime.strptime(e, "%d-%m-%Y").date()
+            if ds > de:
+                s, e = e, s
+            ranges.append({"start": s, "end": e})
+    if ranges:
+        out["ranges"] = ranges
+
+    return out
+
+
+def _looks_like_free_text(message: str, step_options: list[str]) -> bool:
+    """True when the message is NOT an exact button/option tap and NOT a bare
+    calendar range post - i.e. genuine free text worth running extraction on.
+
+    IMPORTANT: a full sentence that merely *contains* dates (e.g. "Tax Statement
+    for 01-04-2018 to 31-03-2025 and ...") is still free text. Only a BARE
+    date / "DD-MM-YYYY to DD-MM-YYYY" picker post (just dates + connectors) is
+    treated as a picker tap and skipped."""
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    low = msg.lower()
+    if any(opt.lower() == low for opt in (step_options or [])):
+        return False
+    if low in {"generate", "change", "yes", "no", "go back to main menu",
+               "main menu", "end chat"}:
+        return False
+    # Bare calendar post? Strip out dates + connectors; if nothing meaningful
+    # remains, it's a picker tap, not a sentence.
+    residue = re.sub(r"\b\d{1,2}[-/]\d{1,2}[-/]\d{4}\b", "", msg)
+    residue = re.sub(r"[\s,./\-]|(?:\bto\b)|(?:\band\b)", "", residue, flags=re.IGNORECASE)
+    if (_parse_range(msg) or _parse_date(msg)) and not residue.strip():
+        return False
+    return True
 
 
 def _match(text: str, options: list[str]) -> str | None:
@@ -364,10 +495,195 @@ def _resp(state, reply, qr, flow_state, customer_message, status="ok", update=No
                                     flow_state=flow_state, status=status), ns)
 
 
+def _generate_ranges(state, report, ranges, customer_message):
+    """Generate ONE report across MULTIPLE date ranges (literal dates, decision b).
+    Fires the statement API once per range, then returns a single combined reply."""
+    from src.gateways.statement_api import request_statement_fireandforget, StatementResult
+
+    masked = "your registered email"
+    ok, no_data, errored = [], [], []
+    for r in ranges:
+        start, end = r["start"], r["end"]
+        result = None
+        try:
+            from src.core.langchain_agent import run_tool
+            tool_out = run_tool(
+                "request_statement",
+                sub_account_id=state.sub_account_id or "",
+                report_name=report["jobname"],
+                start_date=start, end_date=end, endpoint=report["endpoint"],
+            )
+            if tool_out is not None:
+                result = StatementResult(
+                    success=bool(tool_out.get("success")),
+                    masked_email=tool_out.get("masked_email", "") or "",
+                    error_message=tool_out.get("error") or "",
+                )
+        except Exception as exc:
+            logger.warning("[STATEMENT] multi-range tool path failed: %s — direct", exc)
+        if result is None:
+            result = request_statement_fireandforget(
+                sub_account_id=state.sub_account_id or "",
+                api_jobname=report["jobname"], endpoint=report["endpoint"],
+                start_date=start, end_date=end,
+            )
+        if result and result.masked_email:
+            masked = result.masked_email
+        label = f"{start} to {end}"
+        if result and result.success:
+            ok.append(label)
+        elif result and (("no documents" in (result.error_message or "").lower())
+                          or ("not found" in (result.error_message or "").lower())
+                          or ("404" in (result.error_message or ""))
+                          or ("502" in (result.error_message or ""))):
+            no_data.append(label)
+        else:
+            errored.append(label)
+
+    lines = []
+    if ok:
+        lines.append(
+            f"We've emailed your {report['name']} for the following period(s) "
+            f"to {masked}:\n" + "\n".join(f"• {l}" for l in ok))
+    if no_data:
+        lines.append("No statement was found for:\n" + "\n".join(f"• {l}" for l in no_data))
+    if errored:
+        lines.append("We couldn't process these period(s) right now (please retry):\n"
+                     + "\n".join(f"• {l}" for l in errored))
+    reply = "\n\n".join(lines) if lines else (
+        "We were unable to process your request at this time. "
+        "Please try again later or contact support at 022-40508080.")
+    status = "ok" if ok or no_data else "error"
+
+    ns = state.model_copy(update={"flow_state": "session_end_response",
+                                  "history": _hist(state, customer_message, reply)})
+    save_session(state.conversation_id, ns)
+    return (InternalMessageResponse(reply_message=reply, quick_reply_options=_END_QR,
+                                    flow_state="session_end_response", status=status), ns)
+
+
+def _options_for_state(fs: str, cd: dict) -> list[str]:
+    """The quick-reply options a given step shows — used to detect an exact
+    button tap (so the free-text slot-fill pre-pass can skip it)."""
+    if fs == "statement_category":
+        return TOP_CATEGORIES
+    if fs == "report_type":
+        return [it["name"] for it in _top_items(cd.get("category", ""))]
+    if fs == "subtab_select":
+        sub = _find_subtab(cd.get("category", ""), cd.get("subtab", ""))
+        return [r["name"] for r in sub["reports"]] if sub else []
+    if fs == "segment_select":
+        return SEGMENTS
+    if fs == "date_range_fy":
+        return _financial_years()
+    if fs == "date_range_month":
+        return MONTH_NAMES if cd.get("selected_year") else YEAR_OPTIONS
+    return []
+
+
+def _ranges_summary(ranges: list[dict]) -> str:
+    return "\n".join(f"• {r['start']} to {r['end']}" for r in ranges)
+
+
+def _msg_confirm_generate(report_name: str, ranges: list[dict]) -> str:
+    if len(ranges) == 1:
+        return (f"I'll email your {report_name} for {ranges[0]['start']} to "
+                f"{ranges[0]['end']}.\n\nShall I generate it?")
+    return (f"I'll email your {report_name} for these periods:\n\n"
+            f"{_ranges_summary(ranges)}\n\nShall I generate them?")
+
+
+def _try_slot_fill(state: SessionState, customer_message: str, step_options: list[str]):
+    """
+    Free-text pre-pass. If the message carries slots (report/dates), merge them
+    and, when enough is known, jump straight to confirm_generate (or the right
+    date step). Returns a response tuple to short-circuit, or None to let the
+    normal step logic run.
+    Gated: only runs on genuine free text (not button/picker taps).
+    """
+    if not _looks_like_free_text(customer_message, step_options):
+        return None
+
+    slots = _extract_slots(customer_message)
+    if not slots:
+        return None
+
+    cd = dict(state.collected_data)
+    # Merge WITHOUT clobbering values already chosen in-flow.
+    if "report_name" not in cd and slots.get("report_name"):
+        cd["report_name"] = slots["report_name"]
+        # derive category from the resolved report for consistency
+        rep = _find_report(cd["report_name"])
+        for c, items in REPORTS_BY_CATEGORY.items():
+            for it in items:
+                leaves = it["reports"] if it.get("subtab") else [it]
+                if any(l["name"] == cd["report_name"] for l in leaves):
+                    cd["category"] = c
+    if "category" not in cd and slots.get("category"):
+        cd["category"] = slots["category"]
+    if "segment" not in cd and slots.get("segment"):
+        cd["segment"] = slots["segment"]
+    if "ranges" not in cd and slots.get("ranges"):
+        cd["ranges"] = slots["ranges"]
+
+    report = _find_report(cd.get("report_name", "")) if cd.get("report_name") else None
+
+    # Enough to confirm? need a resolved report + at least one date range.
+    if report and cd.get("ranges"):
+        di = report.get("date_input", "")
+        # segment-first reports still need a segment before generating
+        if di in ("segment_then_fy", "segment_then_range") and not cd.get("segment"):
+            return _resp(state, _msg_segment(cd.get("report_name", "")), SEGMENTS, "segment_select",
+                         customer_message, update={"flow": "statement", "collected_data": cd})
+        return _resp(state, _msg_confirm_generate(cd["report_name"], cd["ranges"]),
+                     ["Generate", "Change"], "confirm_generate", customer_message,
+                     update={"flow": "statement", "collected_data": cd})
+
+    # Report known but NO dates → jump to that report's date step.
+    if report and not cd.get("ranges"):
+        return _advance_to_date(
+            state.model_copy(update={"flow": "statement", "collected_data": cd}),
+            report, customer_message)
+
+    # Only category known → jump to its report list.
+    if cd.get("category") and not report:
+        names = [it["name"] for it in _top_items(cd["category"])]
+        return _resp(state, _msg_reports(cd["category"]), names, "report_type",
+                     customer_message, update={"flow": "statement", "collected_data": cd})
+
+    return None
+
+
 # ── Main handler ──────────────────────────────────────────────────────────────
 def handle_statement(state: SessionState, customer_message: str) -> tuple[InternalMessageResponse, SessionState]:
     fs = state.flow_state
     cd = state.collected_data
+
+    # ── CONFIRM & GENERATE (multi-range, single report) ───────────────────────
+    if fs == "confirm_generate":
+        low = customer_message.strip().lower()
+        if low in ("change", "no", "edit"):
+            # fall back to the normal picker for this report's date step
+            report = _find_report(cd.get("report_name", ""))
+            if report:
+                return _advance_to_date(state, report, customer_message)
+            return _resp(state, _msg_category(), TOP_CATEGORIES, "statement_category",
+                         customer_message)
+        # anything else (Generate / yes) → generate every range for the one report
+        report = _find_report(cd.get("report_name", "")) or {}
+        ranges = cd.get("ranges", [])
+        if not report or not ranges:
+            return _resp(state, _msg_category(), TOP_CATEGORIES, "statement_category",
+                         customer_message)
+        return _generate_ranges(state, report, ranges, customer_message)
+
+    # ── Free-text slot-fill pre-pass (skips when it's a button/picker tap) ─────
+    # Not run at 'start' (no step options yet) nor on terminal states.
+    if fs not in ("start", "session_end_response", "confirm_generate"):
+        _step_opts = _options_for_state(fs, cd)
+        short = _try_slot_fill(state, customer_message, _step_opts)
+        if short is not None:
+            return short
 
     # ── START: account check ──────────────────────────────────────────────────
     if fs == "start":
@@ -379,6 +695,13 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
         if status in ("deactivated", "purged"):
             return _resp(state, _msg_deactivated(), _END_QR, "session_end_response",
                          customer_message, status="end", update={"flow": "statement"})
+        # Free-text slot-fill at entry: the customer's first message may already
+        # name the report + date range(s) → skip the questions and confirm.
+        short = _try_slot_fill(
+            state.model_copy(update={"flow": "statement"}),
+            customer_message, step_options=TOP_CATEGORIES)
+        if short is not None:
+            return short
         return _resp(state, _msg_category(), TOP_CATEGORIES, "statement_category",
                      customer_message, update={"flow": "statement"})
 
@@ -425,16 +748,17 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
     # ── SEGMENT select ──────────────────────────────────────────────────────────
     if fs == "segment_select":
         seg = _match(customer_message, SEGMENTS)
+        _rn = cd.get("report_name", "")
         if not seg:
-            return _resp(state, _msg_segment(), SEGMENTS, "segment_select", customer_message, status="reprompt")
-        report = _find_report(cd.get("report_name", ""))
+            return _resp(state, _msg_segment(_rn), SEGMENTS, "segment_select", customer_message, status="reprompt")
+        report = _find_report(_rn)
         next_input = (report or {}).get("date_input", "")
         cd2 = {**cd, "segment": seg}
         if next_input == "segment_then_fy":
-            return _resp(state, _msg_fy(), _financial_years(), "date_range_fy", customer_message,
+            return _resp(state, _msg_fy(_rn), _financial_years(), "date_range_fy", customer_message,
                          update={"collected_data": cd2})
         # segment_then_range → UI shows a 30-day calendar range picker.
-        return _resp(state, _msg_range(), [], "date_range_30", customer_message,
+        return _resp(state, _msg_range(_rn), [], "date_range_30", customer_message,
                      update={"collected_data": cd2})
 
     # ── FY PICKER ────────────────────────────────────────────────────────────────
@@ -445,7 +769,8 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
             sel = _extract(_EXTRACT_FY_SYS, customer_message, {"options": ", ".join(fy_opts)}).get("selected")
             label = _match(sel or "", fy_opts)
         if not label:
-            return _resp(state, "Please select a valid financial year from the options:", fy_opts,
+            return _resp(state, f"Please select a valid financial year{_for(cd.get('report_name',''))} "
+                         "from the options:", fy_opts,
                          "date_range_fy", customer_message, status="reprompt")
         start, end = _resolve_fy_dates(label)
         return _send_and_confirm(state, _find_report(cd.get("report_name", "")) or {},
@@ -464,7 +789,8 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
         # Preset button ("Last 7/15/30 days") first, then typed range.
         rng = _preset_range(customer_message) or _parse_range(customer_message)
         if not rng:
-            return _resp(state, _msg_range(), [], "date_range_30", customer_message, status="reprompt")
+            return _resp(state, _msg_range(cd.get("report_name", "")), [], "date_range_30",
+                         customer_message, status="reprompt")
         d1, d2 = rng
         if (d2 - d1).days > 30 or d2 > date.today():
             return _resp(state, _msg_range_wrong(), [], "date_range_30", customer_message, status="reprompt")
@@ -477,9 +803,9 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
         if "selected_year" not in cd:
             year = _match(customer_message, YEAR_OPTIONS) or _extract(_EXTRACT_DATE_SYS, customer_message).get("selected_year")
             if year not in YEAR_OPTIONS:
-                return _resp(state, _msg_month_year(), YEAR_OPTIONS, "date_range_month",
+                return _resp(state, _msg_month_year(cd.get("report_name", "")), YEAR_OPTIONS, "date_range_month",
                              customer_message, status="reprompt")
-            return _resp(state, _msg_month_name(), MONTH_NAMES, "date_range_month", customer_message,
+            return _resp(state, _msg_month_name(cd.get("report_name", "")), MONTH_NAMES, "date_range_month", customer_message,
                          update={"collected_data": {**cd, "selected_year": year}})
         year = cd["selected_year"]
         month = _match(customer_message, MONTH_NAMES)
@@ -487,7 +813,7 @@ def handle_statement(state: SessionState, customer_message: str) -> tuple[Intern
             sel = _extract(_EXTRACT_DATE_SYS, customer_message).get("selected_month")
             month = _match(sel or "", MONTH_NAMES)
         if not month:
-            return _resp(state, _msg_month_name(), MONTH_NAMES, "date_range_month",
+            return _resp(state, _msg_month_name(cd.get("report_name", "")), MONTH_NAMES, "date_range_month",
                          customer_message, status="reprompt")
         m = MONTH_NAMES.index(month) + 1
         last = calendar.monthrange(int(year), m)[1]
@@ -527,18 +853,20 @@ def _advance_to_date(state, report, customer_message):
             logger.warning("[STATEMENT] CML submit failed: %s", exc)
         return _resp(state, _msg_cml_ack(), _END_QR, "session_end_response", customer_message)
 
+    _rn = report.get("name", "")
+
     if di == "fy_picker":
-        return _resp(state, _msg_fy(), _financial_years(), "date_range_fy", customer_message)
+        return _resp(state, _msg_fy(_rn), _financial_years(), "date_range_fy", customer_message)
 
     if di in ("segment_then_fy", "segment_then_range"):
-        return _resp(state, _msg_segment(), SEGMENTS, "segment_select", customer_message)
+        return _resp(state, _msg_segment(_rn), SEGMENTS, "segment_select", customer_message)
 
     if di == "single_date":
         today_str = date.today().strftime("%d-%m-%Y")
-        return _resp(state, _msg_single_date(today_str), [today_str], "single_date", customer_message)
+        return _resp(state, _msg_single_date(today_str, _rn), [today_str], "single_date", customer_message)
 
     if di == "date_range_30":
-        return _resp(state, _msg_range(), [], "date_range_30", customer_message)
+        return _resp(state, _msg_range(_rn), [], "date_range_30", customer_message)
 
     # month_picker (default)
-    return _resp(state, _msg_month_year(), YEAR_OPTIONS, "date_range_month", customer_message)
+    return _resp(state, _msg_month_year(_rn), YEAR_OPTIONS, "date_range_month", customer_message)

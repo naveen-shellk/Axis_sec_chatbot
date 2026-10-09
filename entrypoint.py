@@ -89,6 +89,11 @@ try:
     _warmup_agent()
 except Exception as _exc:
     _log.warning("agent warmup skipped: %s", _exc)
+try:
+    from src.core.kb_retrieval import warmup as _warmup_kb
+    _warmup_kb()
+except Exception as _exc:
+    _log.warning("kb warmup skipped: %s", _exc)
 
 
 def _generate_escalation_summary(session, conversation_id: str, last_message: str) -> str:

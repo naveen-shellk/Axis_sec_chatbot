@@ -83,10 +83,14 @@ def request_statement_fireandforget(
                 error_message=f"Gateway VPC error: {text[:120]}",
             )
         if "error" in raw and raw.get("error"):
+            # Include the detail body so downstream no-data detection can see
+            # "no documents"/"not found"/404 (the direct path puts the API body
+            # in "detail", the short code in "error").
+            _msg = f"{raw.get('error')} {raw.get('detail', '')}".strip()
             return StatementResult(
                 success=False,
                 masked_email=masked,
-                error_message=str(raw["error"]),
+                error_message=_msg,
             )
         # Extract report_id if present (exports endpoint returns it)
         report_id = 0

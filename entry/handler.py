@@ -8,11 +8,11 @@ classification, and the per-flow step logic (statement date pickers, closure
 confirmation, order segments, etc.) with their static messages and quick
 replies. This matches the documented flowcharts.
 
-Authentication: account-required flows are gated behind a secure
-mock OTP phone flow. When such a flow is requested and the session is not yet
-authenticated, we ask for the registered mobile number → send OTP → verify →
-the backend resolves the Sub-Account ID from the number → the pending flow
-resumes. General flows need no auth.
+Authentication: account-required flows need a Client ID (Sub-Account ID), which
+the client supplies in the request payload (handled in app/web routes → passed
+as sub_account_id, which marks the session authenticated). We NEVER ask the
+customer for it in chat. If an account flow is reached without a Client ID, we
+show a sign-in notice + the main menu instead. General flows need no identity.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 from src.core.llm import call_intent_llm
 from src.core.session_store import get_or_create_session, save_session, clear_session
-from src.auth.otp_service import send_otp, verify_otp
 
 # No-auth flows
 from src.flows.bank_query.handler    import handle_bank_query
@@ -52,7 +51,43 @@ _FULL_MENU = [
     "Statement", "IPO", "Account Details", "Brokerage and Charges",
     "Login Query", "Order Status",
 ]
+# Pre-login (no Client ID) menu — only the flows that work WITHOUT an account
+# identity. Shown when the customer is not authenticated so we never offer an
+# option that would immediately be blocked by the auth gate.
+_PRELOGIN_MENU = [
+    "Bank Query", "How To Trade", "Edit Profile", "Need More Help",
+]
 _FOLLOWUP_REPLIES = ["Main Menu", "End Chat"]
+
+# ── Complaint handling ────────────────────────────────────────────────────────
+# When the router flags a genuine grievance/dispute (complaint=true) AND a
+# serviceable flow handled the request, we still show the self-service data but
+# append an offer to connect to a live agent. The customer can tap the option to
+# enter the need_more_help escalation flow.
+_COMPLAINT_OFFER = (
+    "\n\nIf this still looks wrong, I can connect you to a live agent to "
+    "raise a complaint."
+)
+_TALK_TO_AGENT = "Talk to a live agent"
+
+
+def _append_complaint_offer(resp: "InternalMessageResponse", complaint: bool):
+    """Append the live-agent offer + quick-reply to a serviceable flow's reply
+    when the turn was flagged as a genuine complaint. No-op otherwise, and skips
+    turns that are themselves already escalations/auth prompts."""
+    if not complaint or resp is None:
+        return resp
+    if resp.status in ("escalate", "auth_required") or resp.eventid == "1002":
+        return resp
+    if _COMPLAINT_OFFER.strip()[:20] in (resp.reply_message or ""):
+        return resp  # already appended
+    opts = list(resp.quick_reply_options or [])
+    if _TALK_TO_AGENT not in opts:
+        opts = [_TALK_TO_AGENT] + opts
+    return resp.model_copy(update={
+        "reply_message": (resp.reply_message or "") + _COMPLAINT_OFFER,
+        "quick_reply_options": opts,
+    })
 
 # ── Flow maps ─────────────────────────────────────────────────────────────────
 _NO_AUTH_FLOWS = {
@@ -70,6 +105,28 @@ _AUTH_FLOWS = {
     "order_status":    handle_order_status,
     "closure":         handle_closure,   # intent-only — not in main menu
 }
+
+# Friendly, customer-facing labels for each intent (used in multi-intent
+# deferral notes and queued-flow transitions — avoids raw names like
+# "Order Status" when the request was specifically order history).
+_INTENT_LABELS = {
+    "statement":       "your statement request",
+    "order_status":    "your order request",
+    "brokerage":       "your charges request",
+    "account_details": "your account details",
+    "ipo":             "your IPO request",
+    "login_query":     "your login query",
+    "closure":         "your account closure request",
+    "bank_query":      "your bank query",
+    "edit_profile":    "your profile update",
+    "how_to_trade":    "your how-to-trade query",
+    "need_more_help":  "connecting you to an agent",
+}
+
+
+def _intent_label(intent: str) -> str:
+    return _INTENT_LABELS.get(intent, intent.replace("_", " ").title())
+
 
 _GREETING_MSG = (
     "👋 Welcome to Axis Direct! I'm your virtual assistant.\n\n"
@@ -134,6 +191,7 @@ _THRESHOLD = 0.60
 # Exact button-label fast-path (bypasses the intent LLM for known button taps).
 _BUTTON_EXACT: dict[str, str] = {
     "need more help":        "need_more_help",
+    "talk to a live agent":  "need_more_help",   # complaint-offer quick reply
     "bank query":            "bank_query",
     "how to trade":          "how_to_trade",
     "edit profile":          "edit_profile",
@@ -185,110 +243,27 @@ def handle_message(
             eventid="1001",
         )
 
+    # ── Global "Talk to a live agent" — works from ANY flow state ─────────────
+    # This is the quick-reply shown with the complaint offer. It must escalate
+    # regardless of the active flow, so it short-circuits into need_more_help
+    # before the active-flow continuation consumes it as flow input.
+    if raw_input.strip().lower() in {"talk to a live agent", "talk to live agent"}:
+        new_state = state.model_copy(update={"flow": "need_more_help", "flow_state": "start"})
+        save_session(conversation_id, new_state)
+        logger.info("[ENTRY] conv=%s → global 'talk to a live agent' → need_more_help", conversation_id)
+        resp, _ = handle_need_more_help(new_state, raw_input, "Incoming message")
+        return resp
+
+    # ── Global "Go back to main menu" — works from ANY state ──────────────────
+    # The navigation quick-reply shown after FAQ answers and flow endings. Reset
+    # to a clean session and show the welcome + full menu.
+    if raw_input.strip().lower() in {"go back to main menu", "back to main menu", "main menu"}:
+        clean = state.model_copy(update={"flow": None, "flow_state": "main_menu",
+                                         "collected_data": {}})
+        logger.info("[ENTRY] conv=%s → global 'go back to main menu'", conversation_id)
+        return _greeting_response(clean, raw_input, conversation_id)
+
     # ── Awaiting phone (collect registered mobile → send OTP) ─────────────────
-    if state.flow in ("awaiting_phone", "awaiting_sub_account_id"):
-        import re as _re
-        digits = "".join(ch for ch in raw_input if ch.isdigit())
-        if len(digits) >= 10:
-            phone = digits[-10:]
-            send_otp(phone)
-            logger.info("[ENTRY] conv=%s phone=***%s → OTP sent", conversation_id, phone[-4:])
-            _ASK_OTP = (
-                f"An OTP has been sent to your registered mobile number "
-                f"ending in {phone[-4:]}.\n\n"
-                "Please enter the 6-digit OTP to verify your identity."
-            )
-            otp_state = state.model_copy(update={
-                "flow":       "awaiting_otp",
-                "flow_state": "awaiting_otp",
-                "collected_data": {**state.collected_data, "otp_phone": phone},
-                "history": state.history + [
-                    {"role": "user",      "content": raw_input},
-                    {"role": "assistant", "content": _ASK_OTP},
-                ],
-            })
-            save_session(conversation_id, otp_state)
-            return InternalMessageResponse(
-                reply_message=_ASK_OTP, quick_reply_options=[],
-                flow_state="awaiting_otp", status="ok", eventid="1001",
-            )
-        _ASK_AGAIN = (
-            "I couldn't find a valid mobile number in your message.\n\n"
-            "Please enter your 10-digit registered mobile number:"
-        )
-        save_session(conversation_id, state.model_copy(update={
-            "flow": "awaiting_phone", "flow_state": "awaiting_phone",
-            "history": state.history + [
-                {"role": "user", "content": raw_input},
-                {"role": "assistant", "content": _ASK_AGAIN},
-            ],
-        }))
-        return InternalMessageResponse(
-            reply_message=_ASK_AGAIN, quick_reply_options=[],
-            flow_state="awaiting_phone", status="ok", eventid="1001",
-        )
-
-    # ── Awaiting OTP (verify → resolve sub-account → resume PENDING flow) ──────
-    if state.flow == "awaiting_otp":
-        import re as _re
-        otp_phone = state.collected_data.get("otp_phone")
-        match = _re.search(r'\b(\d{4,8})\b', raw_input)
-        entered_otp = match.group(1) if match else raw_input.strip()
-
-        result = verify_otp(otp_phone or "", entered_otp)
-        if result.get("verified"):
-            resolved_sub_id = result.get("sub_account_id")
-            pending_intent  = state.collected_data.get("pending_intent")
-            # Other intents captured before auth (multi-intent case).
-            queued_intents  = list(state.collected_data.get("pending_intents", []) or [])
-            logger.info("[ENTRY] conv=%s OTP verified → sub_account_id=%s, resuming intent=%r queued=%r",
-                        conversation_id, resolved_sub_id, pending_intent, queued_intents)
-            new_state = state.model_copy(update={
-                "authenticated":       True,
-                "sub_account_id":      resolved_sub_id,
-                "auth_sub_account_id": resolved_sub_id,
-                "auth_phone":          otp_phone,
-                "flow":                pending_intent,
-                "flow_state":          "start",
-                "collected_data": {
-                    k: v for k, v in state.collected_data.items()
-                    if k not in ("pending_intent", "pending_intents", "otp_phone")
-                },
-            })
-            save_session(conversation_id, new_state)
-
-            # ── Multi-intent resume: if OTP gated a multi-intent turn, run the
-            # FULL set (resumed + queued) through the parallel path so both
-            # flows' first steps fire together and merge into one reply.
-            if queued_intents and pending_intent:
-                all_flows = {**_NO_AUTH_FLOWS, **_AUTH_FLOWS}
-                run_intents = [i for i in ([pending_intent] + queued_intents) if i in all_flows]
-                seen = set()
-                run_intents = [i for i in run_intents if not (i in seen or seen.add(i))]
-                if len(run_intents) > 1:
-                    _SINGLE_SHOT = {"bank_query", "edit_profile", "ipo", "account_details", "login_query"}
-                    return _run_multi_intent_parallel(new_state, raw_input, run_intents,
-                                                      all_flows, _SINGLE_SHOT)
-
-            # Resume the single pending auth flow deterministically at its start step.
-            if pending_intent in _AUTH_FLOWS:
-                resp, _ = _AUTH_FLOWS[pending_intent](new_state, raw_input)
-                return resp
-            # No pending flow (e.g. authed proactively) → show the menu.
-            return _greeting_response(new_state, raw_input, conversation_id)
-        _OTP_INVALID = "OTP invalid. Please check the code and enter the 6-digit OTP again."
-        save_session(conversation_id, state.model_copy(update={
-            "history": state.history + [
-                {"role": "user", "content": raw_input},
-                {"role": "assistant", "content": _OTP_INVALID},
-            ],
-        }))
-        logger.info("[ENTRY] conv=%s OTP verify failed", conversation_id)
-        return InternalMessageResponse(
-            reply_message=_OTP_INVALID, quick_reply_options=[],
-            flow_state="awaiting_otp", status="ok", eventid="1001",
-        )
-
     # ── Greeting → static welcome + full menu ─────────────────────────────────
     if raw_input.strip().lower() in _GREETING_WORDS:
         return _greeting_response(state, raw_input, conversation_id)
@@ -304,16 +279,22 @@ def handle_message(
             if pending:
                 return _dispatch_pending_intent(new_state, raw_input, pending)
             return _resolve_and_dispatch(new_state, raw_input, input_type)
+        # Flow finished with a terminal reply but still has queued intents →
+        # resume the next one now and merge, so it isn't stranded.
+        if _is_terminal_resp(resp) and new_state.collected_data.get("pending_intents"):
+            return _resume_pending_after_terminal(resp, new_state, raw_input, input_type)
         return resp
     if state.flow in _AUTH_FLOWS:
         if not state.authenticated:
-            return _start_phone_auth(state, raw_input, conversation_id, pending_intent=state.flow)
+            return _auth_unavailable(state, raw_input, conversation_id, pending_intent=state.flow)
         resp, new_state = _AUTH_FLOWS[state.flow](state, raw_input)
         if resp.status == "route_to_entry" and not resp.reply_message:
             pending = new_state.collected_data.get("pending_intents", [])
             if pending:
                 return _dispatch_pending_intent(new_state, raw_input, pending)
             return _resolve_and_dispatch(new_state, raw_input, input_type)
+        if _is_terminal_resp(resp) and new_state.collected_data.get("pending_intents"):
+            return _resume_pending_after_terminal(resp, new_state, raw_input, input_type)
         return resp
 
     # ── At main menu — classify intent + dispatch ─────────────────────────────
@@ -328,33 +309,87 @@ def _greeting_response(state, raw_input, conversation_id) -> InternalMessageResp
             {"role": "assistant", "content": _GREETING_MSG},
         ],
     }))
-    logger.info("[ENTRY] conv=%s greeting → full menu", conversation_id)
+    # Authenticated (Client ID present) → full menu. Otherwise only pre-login
+    # options, so we never offer a flow that would be blocked by the auth gate.
+    menu = _FULL_MENU if state.authenticated else _PRELOGIN_MENU
+    logger.info("[ENTRY] conv=%s greeting → %s menu", conversation_id,
+                "full" if state.authenticated else "pre-login")
     return InternalMessageResponse(
-        reply_message=_GREETING_MSG, quick_reply_options=_FULL_MENU,
+        reply_message=_GREETING_MSG, quick_reply_options=menu,
         flow_state="greeting", status="ok", eventid="1001",
     )
 
 
-def _start_phone_auth(state, raw_input, conversation_id, pending_intent) -> InternalMessageResponse:
-    """Begin the OTP phone flow, remembering which flow to resume after verify."""
-    _ASK_PHONE_MSG = (
-        "To access this feature I'll need to verify your identity.\n\n"
-        "Please share your registered mobile number to receive an OTP."
+def _auth_unavailable(state, raw_input, conversation_id, pending_intent) -> InternalMessageResponse:
+    """Account (post-login) flow requested but no Client ID (Sub-Account ID) is
+    on the session.
+
+    Client ID is OPTIONAL for general flows but MANDATORY for account flows, and
+    it is supplied by the client in the request payload — we NEVER ask the
+    customer for it in chat. If it's missing we can't identify the account, so we
+    show a brief notice and the main menu instead of running the flow or
+    prompting for the ID.
+    """
+    _MSG = (
+        "This feature needs you to be signed in to your Axis Direct account. "
+        "Please access it from your logged-in session.\n\n"
+        "In the meantime, here's what I can help you with:"
     )
     save_session(conversation_id, state.model_copy(update={
-        "flow":       "awaiting_phone",
-        "flow_state": "awaiting_phone",
-        "collected_data": {**state.collected_data, "pending_intent": pending_intent},
+        "flow": None, "flow_state": "main_menu", "collected_data": {},
         "history": state.history + [
             {"role": "user",      "content": raw_input},
-            {"role": "assistant", "content": _ASK_PHONE_MSG},
+            {"role": "assistant", "content": _MSG},
         ],
     }))
-    logger.info("[ENTRY] conv=%s auth-required flow %r → phone flow",
+    logger.info("[ENTRY] conv=%s auth-required flow %r → no Client ID, menu fallback",
                 conversation_id, pending_intent)
     return InternalMessageResponse(
-        reply_message=_ASK_PHONE_MSG, quick_reply_options=[],
-        flow_state="awaiting_phone", status="ok", eventid="1001",
+        reply_message=_MSG, quick_reply_options=_PRELOGIN_MENU,
+        flow_state="main_menu", status="auth_required", eventid="1001",
+    )
+
+
+def _try_faq_answer(state: SessionState, raw_input: str):
+    """Try to answer a general/FAQ question from the knowledge base
+    (retrieve + LLM compose). Returns an InternalMessageResponse with the KB
+    answer when confident, else None so the caller shows the menu fallback.
+    Never raises."""
+    try:
+        from src.core.faq import answer_faq
+        faq = answer_faq(raw_input)
+    except Exception as exc:
+        logger.warning("[ENTRY] FAQ attempt failed: %s — menu fallback", exc)
+        return None
+
+    if not (faq.get("found") and faq.get("answer")):
+        return None
+
+    faq_reply = faq["answer"]
+    # After an FAQ answer, offer only navigation — not the full service menu.
+    # flow_state session_end_response so the shared session-end node handles
+    # the "Go back to main menu" / "End Chat" taps (and any new free-text query
+    # re-routes to the classifier).
+    save_session(state.conversation_id, state.model_copy(update={
+        "flow": None, "flow_state": "session_end_response",
+        "history": state.history + [
+            {"role": "user",      "content": raw_input},
+            {"role": "assistant", "content": faq_reply},
+        ],
+    }))
+    logger.info("[ENTRY] conv=%s answered from FAQ KB (score=%.3f)",
+                state.conversation_id, faq.get("score", 0.0))
+    return InternalMessageResponse(
+        reply_message=faq_reply,
+        quick_reply_options=["Go back to main menu", "End Chat"],
+        flow_state="session_end_response", status="ok", eventid="1001",
+        debug_info={
+            "kb_retrieval": {
+                "query":    raw_input,
+                "top_score": round(float(faq.get("score", 0.0) or 0.0), 4),
+                "chunks":   faq.get("retrieved", []),
+            }
+        },
     )
 
 
@@ -364,6 +399,7 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
     fast_intent = _BUTTON_EXACT.get(raw_lower)
     is_multi = False
     intents  = []
+    complaint = False   # set by the router for genuine grievances/disputes
 
     if fast_intent:
         logger.info("[ENTRY] conv=%s button match %r → %s", state.conversation_id, raw_lower, fast_intent)
@@ -394,6 +430,7 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
             raw_intents = [single] if single else ["unknown"]
         confidence = float(parsed.get("confidence", 0.0))
         reasoning  = parsed.get("reasoning", "")
+        complaint  = bool(parsed.get("complaint", False))
 
         # Token accounting into the per-turn accumulator.
         try:
@@ -414,7 +451,7 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
                 state = state.model_copy(update={"sub_account_id": extracted_sub_id})
                 save_session(state.conversation_id, state)
 
-        _valid_set = {*_NO_AUTH_FLOWS, *_AUTH_FLOWS, "greeting", "escalate_to_human", "unknown"}
+        _valid_set = {*_NO_AUTH_FLOWS, *_AUTH_FLOWS, "greeting", "escalate_to_human", "faq", "unknown"}
         if confidence < _THRESHOLD:
             intents = ["unknown"]
         else:
@@ -426,8 +463,8 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
         logger.info("[ENTRY] conv=%s intents=%r confidence=%.2f reasoning=%r multi=%s",
                     state.conversation_id, intents, confidence, reasoning, is_multi)
 
-        if confidence < _THRESHOLD or intent not in (*_NO_AUTH_FLOWS, *_AUTH_FLOWS, "greeting", "escalate_to_human"):
-            if intent not in ("greeting", "escalate_to_human"):
+        if confidence < _THRESHOLD or intent not in (*_NO_AUTH_FLOWS, *_AUTH_FLOWS, "greeting", "escalate_to_human", "faq"):
+            if intent not in ("greeting", "escalate_to_human", "faq"):
                 intent = "unknown"; intents = ["unknown"]; is_multi = False
 
     # ── Auth gate: auth-required flow but not authenticated → phone flow ──────
@@ -435,25 +472,26 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
     # can stash ALL the other intents in pending_intents and resume them after
     # OTP — otherwise the extra intents would be silently dropped.)
     if not is_multi and intent in _AUTH_FLOWS and not state.authenticated:
-        return _start_phone_auth(state, raw_input, state.conversation_id, pending_intent=intent)
+        # Client ID (Sub-Account ID) is mandatory for account flows and comes in
+        # the request payload. Without it we can't identify the customer. We do
+        # NOT prompt for it — show a sign-in notice + menu instead.
+        return _auth_unavailable(state, raw_input, state.conversation_id, pending_intent=intent)
 
     # ── Multi-intent (PARALLEL first-step execution) ──────────────────────────
     _SINGLE_SHOT_FLOWS = {"bank_query", "edit_profile", "ipo", "account_details", "login_query"}
     if is_multi:
-        # If any auth flow is present and not authenticated → auth first.
+        # If any auth flow is present and not authenticated → no Client ID.
         if any(i in _AUTH_FLOWS for i in intents) and not state.authenticated:
             first_auth = next(i for i in intents if i in _AUTH_FLOWS)
-            st = state.model_copy(update={"collected_data": {
-                **state.collected_data, "pending_intents": [i for i in intents if i != first_auth],
-            }})
-            return _start_phone_auth(st, raw_input, state.conversation_id, pending_intent=first_auth)
+            return _auth_unavailable(state, raw_input, state.conversation_id, pending_intent=first_auth)
 
         all_flows = {**_NO_AUTH_FLOWS, **_AUTH_FLOWS}
         # Keep only real, dispatchable flow intents, preserving classifier order.
         run_intents = [i for i in intents if i in all_flows]
         if run_intents:
-            return _run_multi_intent_parallel(state, raw_input, run_intents, all_flows,
+            resp = _run_multi_intent_parallel(state, raw_input, run_intents, all_flows,
                                               _SINGLE_SHOT_FLOWS)
+            return _append_complaint_offer(resp, complaint)
 
     # ── Single-intent dispatch ────────────────────────────────────────────────
     all_flows = {**_NO_AUTH_FLOWS, **_AUTH_FLOWS}
@@ -464,7 +502,7 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
         _t0 = _t.perf_counter()
         resp, _ = all_flows[intent](new_state, raw_input)
         logger.info("[TIMING] flow_dispatch_ms=%d flow=%s", int((_t.perf_counter() - _t0) * 1000), intent)
-        return resp
+        return _append_complaint_offer(resp, complaint)
 
     if intent == "greeting":
         return _greeting_response(state, raw_input, state.conversation_id)
@@ -475,11 +513,25 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
         resp, _ = handle_need_more_help(new_state, raw_input, "Incoming message")
         return resp
 
-    # ── Unknown / out-of-scope → helpful fallback + main menu ─────────────────
-    # A general or off-topic question ("what is 2+2", "hello there", small talk)
-    # must NOT jump to live-agent escalation. Show a hardcoded scope message and
-    # the main menu so the customer can pick a real service. (Explicit human
-    # requests are handled above via need_more_help / escalate_to_human.)
+    # ── FAQ intent → answer from the KB ───────────────────────────────────────
+    # The router explicitly classified this as an informational/FAQ question
+    # ('what is X', 'how does X work', 'are X allowed', etc.). Answer from the
+    # knowledge base; if the KB has no confident match, show the menu.
+    if intent == "faq":
+        faq_resp = _try_faq_answer(state, raw_input)
+        if faq_resp is not None:
+            return faq_resp
+        # no confident KB answer → fall through to the menu below
+
+    # ── Unknown / out-of-scope → FAQ attempt, then helpful fallback + menu ────
+    # A general question not matching a flow. Try the FAQ KB first (catches
+    # informational questions the router left as 'unknown'); if no match, show
+    # the scope message + menu. (Explicit human requests handled above.)
+    if intent == "unknown":
+        faq_resp = _try_faq_answer(state, raw_input)
+        if faq_resp is not None:
+            return faq_resp
+
     logger.info("[ENTRY] conv=%s unknown intent → scope fallback + menu", state.conversation_id)
     _UNKNOWN_MSG = (
         "I'm the Axis Direct assistant — I can help with statements, order status, "
@@ -494,8 +546,9 @@ def _resolve_and_dispatch(state: SessionState, raw_input: str, input_type: str) 
             {"role": "assistant", "content": _UNKNOWN_MSG},
         ],
     }))
+    menu = _FULL_MENU if state.authenticated else _PRELOGIN_MENU
     return InternalMessageResponse(
-        reply_message=_UNKNOWN_MSG, quick_reply_options=_FULL_MENU,
+        reply_message=_UNKNOWN_MSG, quick_reply_options=menu,
         flow_state="main_menu", status="ok", eventid="1001",
     )
 
@@ -582,7 +635,7 @@ def _run_multi_intent_parallel(
         primary_resp, primary_state_out = results[primary_intent]
         if pending_queue:
             combined_msg += ("\n\n_(I'll also help with "
-                             + ", ".join(i.replace('_', ' ').title() for i in pending_queue)
+                             + ", ".join(_intent_label(i) for i in pending_queue)
                              + " after this.)_")
         # Persist the primary (interactive) flow's state as the active session;
         # carry only the remaining INTERACTIVE flows in the queue.
@@ -612,24 +665,58 @@ def _run_multi_intent_parallel(
     )
 
 
+def _is_terminal_resp(resp: InternalMessageResponse) -> bool:
+    """True when a flow turn has finished (nothing more expected for it)."""
+    return (resp.flow_state in ("session_end_response", "ended")
+            or resp.status in ("end", "escalate"))
+
+
+def _resume_pending_after_terminal(active_resp, new_state, raw_input, input_type):
+    """A flow just produced a TERMINAL reply (e.g. statement emailed). If there
+    are still queued multi-intent flows, start the next one NOW and merge its
+    first-step reply beneath the terminal reply, so the second request isn't
+    stranded. Returns a merged response, or the original if nothing is queued."""
+    pending = list(new_state.collected_data.get("pending_intents", []) or [])
+    if not pending:
+        return active_resp
+
+    nxt = _dispatch_pending_intent(new_state, raw_input, pending)
+
+    # Merge: show the completed flow's reply, then the next flow's prompt.
+    merged_msg = (active_resp.reply_message or "").rstrip()
+    if nxt.reply_message:
+        merged_msg = f"{merged_msg}\n\n---\n\n{nxt.reply_message}" if merged_msg else nxt.reply_message
+    return nxt.model_copy(update={"reply_message": merged_msg})
+
+
 def _dispatch_pending_intent(state: SessionState, raw_input: str, pending: list[str]) -> InternalMessageResponse:
     """Dispatch the next queued intent from a multi-intent session."""
     all_flows = {**_NO_AUTH_FLOWS, **_AUTH_FLOWS}
     next_intent = pending[0]
     remaining   = pending[1:]
-    logger.info("[ENTRY] conv=%s pending: dispatching %r remaining=%r",
-                state.conversation_id, next_intent, remaining)
+    # Prefer the ORIGINAL multi-intent message (stashed as pending_raw_input) so
+    # the queued flow can slot-fill the parts meant for it (e.g. "order history
+    # for last month"), instead of the current input which may be "Generate".
+    dispatch_input = state.collected_data.get("pending_raw_input") or raw_input
+    logger.info("[ENTRY] conv=%s pending: dispatching %r remaining=%r (input=%r)",
+                state.conversation_id, next_intent, remaining, dispatch_input[:60])
+    # Start the queued flow with a CLEAN slate — do NOT inherit the previous
+    # flow's slots (report_name, ranges, segment, charges_type, etc.), which
+    # would cross-contaminate (e.g. the statement's FY range leaking into the
+    # order-history request). Only carry control keys forward.
+    _cd = {"pending_intents": remaining}
+    # Keep the original message available so this flow (and any still queued)
+    # can slot-fill the parts meant for it.
+    if remaining:
+        _cd["pending_raw_input"] = state.collected_data.get("pending_raw_input") or raw_input
     new_state = state.model_copy(update={
         "flow": next_intent, "flow_state": "start",
-        "collected_data": {
-            **{k: v for k, v in state.collected_data.items() if k != "pending_intents"},
-            "pending_intents": remaining,
-        },
+        "collected_data": _cd,
     })
     save_session(state.conversation_id, new_state)
     if next_intent in all_flows:
-        resp, _ = all_flows[next_intent](new_state, raw_input)
-        transition = f"Now helping you with **{next_intent.replace('_', ' ').title()}**:\n\n"
+        resp, _ = all_flows[next_intent](new_state, dispatch_input)
+        transition = f"Now helping you with **{_intent_label(next_intent)}**:\n\n"
         return InternalMessageResponse(
             reply_message=transition + resp.reply_message, quick_reply_options=resp.quick_reply_options,
             flow_state=resp.flow_state, status=resp.status, eventid=resp.eventid,

@@ -39,7 +39,6 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from src.api.web_routes import router as web_router
 from src.api.internal_routes import router as internal_router
 from src.api.oauth_routes import router as oauth_router
-from src.api.auth_routes import router as auth_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,7 +161,6 @@ async def unhandled_exception_handler(request, exc):
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(oauth_router)        # POST /oauth/token (client_credentials)
-app.include_router(auth_router)         # POST /auth/send-otp, /auth/verify-otp (mock OTP)
 app.include_router(web_router)          # POST /api/chat  (public — Simcomm)
 app.include_router(internal_router)     # /internal/*     (dev only)
 
@@ -252,6 +250,11 @@ def _warmup_memory():
         _agent_warmup()
     except Exception as exc:
         logging.warning("agent warmup skipped: %s", exc)
+    try:
+        from src.core.kb_retrieval import warmup as _kb_warmup
+        _kb_warmup()
+    except Exception as exc:
+        logging.warning("kb warmup skipped: %s", exc)
 
 
 if __name__ == "__main__":

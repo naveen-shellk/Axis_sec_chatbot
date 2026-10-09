@@ -67,6 +67,7 @@ from models import (
     WebChatRequest,
     WebChatResponse,
     WebEscalationResponse,
+    WebEndChatRequest,
     WebEndChatAck,
 )
 
@@ -322,7 +323,9 @@ def chat(
             conversation_id=conv_id,
             raw_input=message,
             input_type=input_type,
-            sub_account_id=None,
+            # Client_ID (Sub-Account ID) identifies the customer and marks the
+            # session authenticated, so account flows skip the OTP identity step.
+            sub_account_id=(body.client_id or None),
             event=event,           # forwarded — needed for need_more_help no-response handling
         )
     except Exception as exc:
@@ -409,7 +412,14 @@ def chat(
         customer=customer_info,
         quickReplies=quick_replies,
     )
-    return JSONResponse(content=reply.model_dump())
+    payload = reply.model_dump()
+    # Dev/test only: expose KB retrieval debug info (retrieved chunks + scores)
+    # so the test UI can render a "Retrieval" sidebar. Harmless extra field for
+    # real integrations, which ignore unknown keys.
+    debug_info = getattr(response, "debug_info", None)
+    if debug_info:
+        payload["debug"] = debug_info
+    return JSONResponse(content=payload)
 
 
 # ── POST /api/chat/end ────────────────────────────────────────────────────────
@@ -421,14 +431,15 @@ def chat(
     response_model=WebEndChatAck,
 )
 def chat_end(
-    body: WebChatRequest,
+    body: WebEndChatRequest,
     _: HTTPAuthorizationCredentials = Depends(_verify_token),
 ) -> WebEndChatAck:
-    """Clear session when the chat widget closes."""
+    """Clear session when the chat widget closes (best-effort)."""
     from src.core.session_store import clear_session
-    logger.info("POST /api/chat/end conv=%s", body.Conversationid)
+    logger.info("POST /api/chat/end conv=%s client_id=%r endedBy=%r resolution=%r",
+                body.conversation_id, body.client_id, body.endedBy, body.resolution)
     try:
-        clear_session(body.Conversationid)
+        clear_session(body.conversation_id)
     except Exception as exc:
         logger.warning("chat/end session clear error: %s", exc)
     return WebEndChatAck()

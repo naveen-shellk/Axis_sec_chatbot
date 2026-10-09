@@ -330,48 +330,59 @@ def run_agent_turn(prompt: str) -> dict[str, Any]:
 # already do).
 
 _ROUTER_DECISION_SYSTEM = (
-    "You are the routing decision-maker for the Axis Direct web chatbot. "
-    "You do NOT write the reply to the customer — you ONLY decide how to route "
-    "the turn. Another deterministic system produces the actual messages.\n\n"
-    "Decide, from the customer's latest message (using recent conversation for "
-    "context — they may be mid-flow or referring back):\n"
-    "1. Which intent(s) the message maps to. If it clearly covers MORE THAN ONE "
-    "topic, list all (max 3), in the order the customer raised them. Otherwise a "
-    "single-element list.\n"
-    "2. Whether it is a pure greeting, an explicit human/agent request, or "
-    "something you cannot route (unknown).\n"
-    "3. Any numeric account id present in the message.\n\n"
-    "Valid intents:\n"
+    "You route turns for the Axis Direct chatbot. You ONLY classify intent — you "
+    "do NOT write replies, and you NEVER output dates, amounts, periods, report "
+    "names, or segments (a separate extractor does that). Use recent history for "
+    "context (customer may be mid-flow). Classify by the customer's ACTUAL goal, "
+    "not isolated keywords.\n\n"
+    "Intents:\n"
     "  bank_query       — Axis BANK products (loan, credit card, savings, branch)\n"
-    "  how_to_trade     — wants to learn how to place a trade / use the platform\n"
-    "  edit_profile     — update profile details (email, mobile, address)\n"
-    "  statement        — wants a statement/report (tax, ledger, contract notes, etc.)\n"
-    "  ipo              — apply for IPO or check IPO status\n"
-    "  account_details  — wants account info (demat number, trading id, etc.)\n"
-    "  brokerage        — brokerage charges, DP charges, AMC, etc.\n"
+    "  how_to_trade     — HOW DO I / HOW TO place/buy/sell/execute a trade (wants the steps)\n"
+    "  edit_profile     — update profile (email, mobile, address)\n"
+    "  statement        — wants a DOCUMENT: statement/report/contract note/trade book/CML, "
+    "or 'email/send/download me my ...'\n"
+    "  ipo              — apply for or check IPO\n"
+    "  account_details  — static info: demat number, trading id, DP id, account status\n"
+    "  brokerage        — VIEW charges/fees: 'show/see/check my charges', 'why was I "
+    "charged', DP/AMC/brokerage amounts (NO document word)\n"
     "  login_query      — can't login, forgot password, FTL, account locked\n"
-    "  order_status     — check order/trade status or history\n"
+    "  order_status     — status/history of orders or trades placed\n"
     "  closure          — close demat/trading account\n"
-    "  greeting         — PURE greeting only, no embedded intent\n"
+    "  faq              — INFORMATIONAL/conceptual: 'what is X', 'how does X work', "
+    "'explain/define X', eligibility/permission/rules questions. The verb test: "
+    "'Can I / Is it possible / Am I allowed / Will there be / What happens if / Do I "
+    "get' + any topic = faq (NOT how_to_trade, NOT statement). Also account-opening, "
+    "eligibility, 2FA/security, 'what margin is charged' = faq.\n"
+    "  greeting         — PURE greeting, no embedded intent\n"
     "  need_more_help   — EXPLICIT live-agent/human request\n"
-    "  escalate_to_human— Axis Direct query too complex/sensitive (fraud, disputes, grievances)\n"
-    "  unknown          — general questions or anything not clearly above\n\n"
-    "Rules:\n"
-    "- 'greeting' ONLY for a pure greeting; if a greeting embeds an intent "
-    "('hi, I want my statement') → return the embedded intent, not greeting.\n"
-    "- 'need_more_help' ONLY for explicit human/live-agent requests.\n"
-    "- 'escalate_to_human' for Axis Direct queries too advanced for the bot; "
-    "unrelated queries → 'unknown'.\n"
-    "- When unsure → ['unknown'].\n\n"
-    "Return ONLY valid JSON — no markdown, no prose:\n"
+    "  escalate_to_human— ONLY fraud/disputes/grievances no self-service flow handles\n"
+    "  unknown          — anything not clearly above\n\n"
+    "Key rules:\n"
+    "- Multi-intent: if the message clearly covers >1 topic, list all (max 3) in the "
+    "order raised; else a single-element list.\n"
+    "- statement needs an explicit DOCUMENT word (statement/report/email/send/download). "
+    "'show/see/check my charges' without one = brokerage ALONE (not multi-intent).\n"
+    "- A statement ABOUT charges ('brokerage charges statement') = statement, not brokerage.\n"
+    "- A product word (Encash, GTDT, intraday, contract, margin) does NOT force "
+    "how_to_trade/statement — permission/explanation question = faq. Only 'how to "
+    "sell/buy/place' = how_to_trade.\n"
+    "- Conceptual terms (MTM, margin, demat, settlement) = faq, NOT bank_query.\n"
+    "- A greeting that embeds an intent ('hi, I want my statement') → the embedded intent.\n"
+    "- ALWAYS prefer a serviceable intent over escalation. Length, politeness, or "
+    "multiple date ranges do NOT make a request escalate_to_human.\n"
+    "- When unsure → ['unknown'].\n"
+    "- complaint=true ONLY for a genuine grievance about something WRONG ('complaint', "
+    "'wrong charges', 'overcharged', 'not received', 'dispute', 'why was I charged'); a "
+    "message can be both a serviceable intent AND a complaint. 'wrong year/date' is NOT "
+    "a complaint. Neutral view/download requests = false.\n\n"
+    "Return ONLY JSON — no markdown, no prose:\n"
     "{\n"
     '  "intents":        ["<intent1>", "<intent2>"],\n'
     '  "confidence":     <0.0-1.0>,\n'
+    '  "complaint":      <true|false>,\n'
     '  "reasoning":      "<one sentence>",\n'
-    '  "sub_account_id": "<numeric id if present, else null>"\n'
-    "}\n"
-    "sub_account_id: extract ONLY a 5-10 digit trading/customer account id if "
-    "present; else null."
+    '  "sub_account_id": "<5-10 digit account id if present, else null>"\n'
+    "}"
 )
 
 
@@ -419,10 +430,26 @@ def run_router_decision(
         if not isinstance(obj, dict):
             raise ValueError(f"router decision not JSON: {result.get('text','')[:200]}")
         intents = obj.get("intents") or ([obj["intent"]] if obj.get("intent") else [])
+
+        # ── Deterministic guard: statement requires a DOCUMENT keyword ────────
+        # Haiku tends to add 'statement' for any "charges" wording (e.g. "see my
+        # charges"), producing a spurious multi-intent brokerage+statement. Drop
+        # 'statement' when the message has no document cue (statement/report/
+        # email/send/download/document/slip/certificate) AND another serviceable
+        # intent is present — the customer wants to VIEW data, not get a report.
+        if "statement" in intents and len(intents) > 1:
+            _doc_cues = ("statement", "report", "email", "e-mail", "send",
+                         "download", "document", "slip", "certificate", "copy")
+            if not any(c in customer_message.lower() for c in _doc_cues):
+                intents = [i for i in intents if i != "statement"]
+                logger.info("[LC] router guard: dropped spurious 'statement' "
+                            "(no document keyword) → intents=%r", intents)
+
         logger.info("[LC] router_decision (haiku) intents=%r conf=%s", intents, obj.get("confidence"))
         return {
             "intents":        intents or ["unknown"],
             "confidence":     float(obj.get("confidence", 0.0) or 0.0),
+            "complaint":      bool(obj.get("complaint", False)),
             "reasoning":      obj.get("reasoning", ""),
             "sub_account_id": obj.get("sub_account_id"),
             "input_tokens":   int(result.get("input_tokens", 0) or 0),
@@ -430,8 +457,9 @@ def run_router_decision(
         }
     except Exception as exc:
         logger.error("[LC] run_router_decision failed: %s — defaulting unknown", exc)
-        return {"intents": ["unknown"], "confidence": 0.0, "reasoning": "",
-                "sub_account_id": None, "input_tokens": 0, "output_tokens": 0}
+        return {"intents": ["unknown"], "confidence": 0.0, "complaint": False,
+                "reasoning": "", "sub_account_id": None,
+                "input_tokens": 0, "output_tokens": 0}
 
 
 # ── Agentic API decision ──────────────────────────────────────────────────────
@@ -670,7 +698,14 @@ def _fetch_profile_uncached(sub_account_id: str):
                 deactivation_code    = data.get("deactivation_code", ""),
                 deactivation_reason  = data.get("deactivation_reason", ""),
                 demat_account_no     = data.get("demat_account_no", ""),
+                dp_id                = data.get("dp_id", ""),
                 trading_account_no   = data.get("trading_account_no", ""),
+                # segmentsEnabled isn't always surfaced as a top-level field by
+                # the tool layer — fall back to the raw profile so the order-
+                # status segment-active gate has the data it needs.
+                segments_enabled     = data.get("segments_enabled")
+                                       or (data.get("raw", {}) or {}).get("segmentsEnabled")
+                                       or {},
                 raw                  = data.get("raw", {}) or {},
             )
         except Exception as exc:

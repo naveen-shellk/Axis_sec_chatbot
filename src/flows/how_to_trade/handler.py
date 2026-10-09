@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 
 from src.core.conversation import run_conversation_turn
+from src.core.llm import call_intent_llm
 from src.core.session_store import save_session
 from src.flows.how_to_trade.instructions import (
     APP_TYPES, APP_TYPES_NO_INVESTORS,
@@ -35,6 +36,85 @@ from src.shared.session_end import handle_session_end
 from models import InternalMessageResponse, SessionState
 
 logger = logging.getLogger(__name__)
+
+# ── Free-text slot extraction ─────────────────────────────────────────────────
+# When the customer's FIRST message already names the trade type / sub-type /
+# direction / app (e.g. "how to sell holdings using Encash"), extract those and
+# skip the step-by-step questions. Mirrors the slot-fill in the other flows.
+_EXTRACT_SLOTS_SYS = """\
+You extract 'how to trade' details from an Axis Direct customer's message.
+
+Top-level trade types: Cash & ETF, E-Margin & Intraday, Stop Loss, Derivatives, Other
+Derivative sub-types:  Futures, Options, FNO Sell
+"Other" special order sub-types: Encash, GTDT, Intersettlement, Cover
+Apps: Traders App, Investors App, Swift Trade
+
+Return JSON ONLY:
+{
+  "trade_type": "<one of the top-level types OR a sub-type (Futures/Options/FNO Sell/Encash/GTDT/Intersettlement/Cover), or null>",
+  "direction":  "BUY | SELL | null",
+  "app":        "Traders App | Investors App | Swift Trade | null"
+}
+
+Keyword hints (map the customer's wording to the trade_type):
+- Cash & ETF        : buy/sell stocks, shares, ETF, cash, delivery, demat holdings
+- E-Margin & Intraday: e-margin, MTF, margin, intraday, leverage
+- Stop Loss         : stop loss, SL order, trailing stop, stop-loss trigger
+- Derivatives       : futures, options, FNO, F&O (then sub-type Futures/Options/FNO Sell)
+- Encash            : encash, instant payout sell, encash product
+- GTDT              : GTDT, good till date, GTC, extended-validity order
+- Intersettlement   : intersettlement, T1/T+1 sell, unsettled holdings
+- Cover             : cover order, CO order, intraday with mandatory stop-loss
+
+Rules:
+- Map the customer's wording to the CLOSEST known value and return the EXACT label.
+  e.g. "sell my holdings using Encash" -> trade_type="Encash", direction="SELL".
+  "buy shares in cash" -> trade_type="Cash & ETF", direction="BUY".
+- A named sub-type (Encash/GTDT/Intersettlement/Cover/Futures/Options/FNO Sell)
+  IS the trade_type — do NOT return "Other" or "Derivatives" when the specific
+  sub-type is clear.
+- direction (BUY/SELL) applies ONLY to Cash & ETF and E-Margin & Intraday; it is
+  null for every other type (Encash/GTDT/Stop Loss/etc. have no BUY/SELL step).
+- Only fill a field the customer actually implied; else null.
+- Do NOT invent values.
+"""
+
+
+def _extract_slots(message: str) -> dict:
+    """One Haiku call -> whatever how-to-trade slots the free text names."""
+    result = call_intent_llm(
+        _EXTRACT_SLOTS_SYS,
+        [{"role": "user", "content": [{"text": f"Customer message: {message}"}]}],
+    )
+    parsed = result.get("parsed") or {}
+    out: dict = {}
+
+    tt = parsed.get("trade_type")
+    if tt in TRADE_TYPES or tt in DERIVATIVE_TYPES or tt in OTHER_TYPES:
+        out["trade_type"] = tt
+
+    d = (parsed.get("direction") or "").upper()
+    if d in BUY_SELL_TYPES:
+        out["direction"] = d
+
+    app = parsed.get("app")
+    if app in APP_TYPES:
+        out["app"] = app
+
+    return out
+
+
+def _looks_like_free_text(message: str, step_options: list[str]) -> bool:
+    """True when the message is genuine free text, not an exact button tap."""
+    msg = (message or "").strip()
+    if not msg:
+        return False
+    low = msg.lower()
+    if any(opt.lower() == low for opt in (step_options or [])):
+        return False
+    if low in {"go back to main menu", "main menu", "end chat", "yes", "no"}:
+        return False
+    return True
 
 # ── LLM system prompts ────────────────────────────────────────────────────────
 
@@ -154,6 +234,75 @@ def _ask_app(state, customer_message, trade_type, collected_data):
     )
 
 
+def _serve_instructions(state, trade_type, app, customer_message, cd):
+    """Serve the static steps for a fully-resolved trade_type + app, or an
+    unsupported message if the combination has no instructions."""
+    steps = get_instructions(trade_type, app)
+    if not steps:
+        resp, hist = _llm(state, customer_message, {}, _UNSUPPORTED_SYS, "session_end_response")
+        ns = state.model_copy(update={"flow": "how_to_trade",
+                                      "flow_state": "session_end_response", "history": hist})
+        save_session(state.conversation_id, ns)
+        return (InternalMessageResponse(reply_message=resp["message"],
+                                        quick_reply_options=["Go back to main menu", "End Chat"],
+                                        flow_state="session_end_response", status="ok"), ns)
+    reply = f"Here's how to place a *{trade_type}* order on *{app}*:\n\n{steps}"
+    hist = state.history + [
+        {"role": "user", "content": customer_message},
+        {"role": "assistant", "content": reply},
+    ]
+    next_fs = "account_status_check" if state.sub_account_id else "session_end_response"
+    ns = state.model_copy(update={
+        "flow": "how_to_trade", "flow_state": next_fs,
+        "collected_data": {**cd, "trade_type": trade_type, "app": app}, "history": hist,
+    })
+    save_session(state.conversation_id, ns)
+    logger.info("[HOW_TO_TRADE] conv=%s slot-fill served trade=%r app=%r",
+                state.conversation_id, trade_type, app)
+    return (InternalMessageResponse(reply_message=reply,
+                                    quick_reply_options=["Go back to main menu", "End Chat"],
+                                    flow_state=next_fs, status="ok"), ns)
+
+
+def _try_slot_fill(state: SessionState, customer_message: str):
+    """Free-text pre-pass. Resolve as far as the message allows and jump to the
+    right step: full instructions, or app selection, or BUY/SELL. Returns a
+    response tuple to short-circuit, or None to fall back to the normal start."""
+    slots = _extract_slots(customer_message)
+    tt = slots.get("trade_type")
+    if not tt:
+        return None  # nothing useful named → normal step-by-step
+
+    cd = {**state.collected_data, "trade_type": tt}
+    needs_dir = tt in BUY_SELL_TRADES
+    direction = slots.get("direction")
+    app = slots.get("app")
+
+    # BUY/SELL types: fold direction into the key when known.
+    if needs_dir:
+        if not direction:
+            # Trade type known but direction missing → ask BUY/SELL.
+            sys = _BUY_SELL_SYS.format(trade_type=tt)
+            resp, hist = _llm(state, f"(selected {tt})", {"trade_type": tt},
+                              sys, "buy_sell_selection")
+            ns = state.model_copy(update={"flow": "how_to_trade",
+                                          "flow_state": "buy_sell_selection",
+                                          "collected_data": cd, "history": hist})
+            save_session(state.conversation_id, ns)
+            return (InternalMessageResponse(reply_message=resp["message"],
+                                            quick_reply_options=BUY_SELL_TYPES,
+                                            flow_state="buy_sell_selection", status="ok"), ns)
+        tt = f"{tt} {direction}"
+        cd["trade_type"] = tt
+
+    # trade_type (and direction if needed) resolved. App known → serve now.
+    if app:
+        return _serve_instructions(state, tt, app, customer_message, cd)
+
+    # App missing → jump straight to the app-selection step.
+    return _ask_app(state, customer_message, tt, cd)
+
+
 # ── Main handler ──────────────────────────────────────────────────────────────
 
 def handle_how_to_trade(
@@ -165,6 +314,13 @@ def handle_how_to_trade(
 
     # ── Step 1: entry ─────────────────────────────────────────────────────────
     if fs == "start":
+        # Free-text slot-fill: the first message may already name the trade
+        # type / sub-type / direction / app → skip the questions it answered.
+        if _looks_like_free_text(customer_message, []):
+            short = _try_slot_fill(state, customer_message)
+            if short is not None:
+                return short
+
         resp, hist = _llm(state, customer_message, {}, _TRADE_TYPE_SYS, "trade_type_selection")
         new_state = state.model_copy(update={
             "flow": "how_to_trade", "flow_state": "trade_type_selection", "history": hist,

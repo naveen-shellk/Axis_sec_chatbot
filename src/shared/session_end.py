@@ -52,25 +52,39 @@ def handle_session_end(
     """
     import re as _re
     msg_lower = customer_message.strip().lower()
+    # Normalise for exact-navigation comparison: strip trailing punctuation.
+    msg_norm  = _re.sub(r"[.!?]+$", "", msg_lower).strip()
 
     go_back_signals = {
-        "go back", "main menu", "back", "menu", "home", "start over",
-        "restart", "other", "yes", "ok",
+        "go back", "go back to main menu", "main menu", "back", "menu", "home",
+        "start over", "restart", "other", "yes", "ok", "okay",
     }
     end_signals = {
         "end", "end chat", "bye", "goodbye", "exit", "no", "done",
-        "thanks", "thank you", "that's all", "thats all",
+        "thanks", "thank you", "that's all", "thats all", "no thanks",
     }
 
+    # Only treat the turn as a NAVIGATION command when the WHOLE message is that
+    # command (an exact button tap or a bare word), NOT when a trigger word
+    # merely appears inside a longer sentence. A real new request like "what are
+    # Axis Bank's HOME loan options" must fall through to fresh-intent re-routing
+    # instead of matching the "home" go-back word.
+    _MAX_NAV_WORDS = 4  # navigation taps are short; sentences are longer
+
     def _matches(signals: set[str]) -> bool:
-        # Whole-phrase / whole-word match only. Substring matching wrongly fired
-        # on things like "no" inside "know" ("I want to know about trading"),
-        # ending the chat when the customer was starting a new request.
+        # Exact whole-message match (after punctuation strip) always wins.
+        if msg_norm in signals:
+            return True
+        # Otherwise, only allow a single-word trigger when the message itself is
+        # short (<= _MAX_NAV_WORDS) — so "back", "menu please" count, but a full
+        # sentence containing the word does not.
+        if len(msg_norm.split()) > _MAX_NAV_WORDS:
+            return False
         for s in signals:
             if " " in s:
-                if s in msg_lower:            # multi-word phrase — substring is fine
+                if s in msg_norm:
                     return True
-            elif _re.search(rf"\b{_re.escape(s)}\b", msg_lower):  # single word — word boundary
+            elif _re.search(rf"\b{_re.escape(s)}\b", msg_norm):
                 return True
         return False
 

@@ -48,7 +48,8 @@ def call_tool(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
     _GATEWAY_URL = os.getenv(
         "AGENTCORE_GATEWAY_URL",
-        "https://asl-aws-dev-orion-bot-agentcore-gateway-pgywge4cf0"
+        # thor's deployed AgentCore Gateway (the 5 shared targets live here).
+        "https://asl-aws-dev-orion-bot-agentcore-gateway-rysatyka9a"
         ".gateway.bedrock-agentcore.ap-south-1.amazonaws.com/mcp",
     )
     _REGION  = os.getenv("AWS_REGION", "ap-south-1")

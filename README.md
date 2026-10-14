@@ -1,199 +1,156 @@
-# ASL Web Chatbot — Pre-Login Flows
+# ASL Web Chatbot
 
-**Axis Securities Limited — Web Channel (Simcomm / WebX Integration)**
+**Axis Securities Limited — Axis Direct customer-service chatbot (web channel today, WhatsApp later).**
 
-This service is the backend for the Axis Direct web chatbot. It handles pre-login (unauthenticated) customer flows via the web channel.
+The backend is a channel-agnostic **agent** (the brain) with thin **channel adapters** in front
+of it. A channel adapter only translates its transport payload to/from the agent — all routing,
+flow logic, LLM calls, Knowledge Base retrieval, and API/gateway calls live in `agent/`.
 
 ---
 
-## Architecture
+## Project structure
 
 ```
-Customer (web browser)
-    └─► WebX frontend (Simcomm)
-            └─► API Gateway  ◄── endpoint + auth details shared by ASL
-                    └─► This service (chatbot_web)
-                            └─► AWS Bedrock (Claude via AgentCore)
+chatbot_langchain/
+├── agent/                     # THE BRAIN (channel-agnostic; what AgentCore deploys)
+│   ├── handler.py             # handle_message() — greeting menu, intent routing, flow dispatch
+│   ├── models.py              # shared Pydantic models (request/response/session)
+│   ├── entrypoint.py          # thin AgentCore Runtime entry (deploy-time; lazy SDK import)
+│   ├── core/                  # llm, langchain_agent, kb_retrieval, faq, conversation, session_store, tools
+│   ├── flows/                 # one package per flow (statement, brokerage, order_status, closure, ...)
+│   ├── gateways/              # API clients (gateway_client, statement_api, order_api, customer_api)
+│   ├── shared/                # session_end, shared helpers
+│   └── utils/                 # token_logger
+├── channels/                  # THIN transport adapters (no business logic)
+│   └── web/                   # FastAPI web channel (local testing + Simcomm/WebX)
+│       ├── app.py             # FastAPI server (POST /api/chat, /oauth, /health, /internal)
+│       ├── web_routes.py      # /api/chat, /api/chat/end, /health
+│       ├── oauth_routes.py    # POST /oauth/token
+│       └── internal_routes.py # /internal/* (dev only)
+├── web_test_ui/               # static test UI (index.html) — local manual testing
+├── config/                    # .env (local secrets) + .env.example (template)
+├── db/                        # schema.sql
+├── logs/                      # turn logs (log.txt)
+└── requirements.txt
 ```
 
-The API Gateway acts as the web ingress. Once infrastructure provisioning is complete, the gateway domain and auth token are shared with the Simcomm team.
+**Why this split:** the agent is a single self-contained package AgentCore can run via
+`agent/entrypoint.py`, while each channel (web now, WhatsApp later) sits in `channels/` and just
+calls `agent.handler.handle_message()`. Adding a new channel does not touch the brain.
 
 ---
 
-## Pre-Login Flows
+## Run locally
 
-| Flow | Trigger | Behavior |
-|------|---------|----------|
-| **Bank Query** | Customer asks about Axis Bank (loans, cards, savings) | Redirect to Axis Bank contact info |
-| **How To Trade** | Customer wants trading guidance | Multi-turn: trade type → BUY/SELL → app → step-by-step instructions |
-| **Need More Help** | Customer requests live agent | Escalate → `eventid: 1002` → WxCC |
-| **Edit Profile** | Customer wants to update profile | Show Axis Direct login deeplink |
-
-All flows are **anonymous** — no customer authentication required.
-
----
-
-## Quick Start
+From the `chatbot_langchain/` root:
 
 ```bash
-cd chatbot_web
 pip install -r requirements.txt
-cp config/.env.example config/.env   # fill in AWS keys + WEB_API_TOKEN
-python app.py
-# Server starts on http://localhost:8002
+cp config/.env.example config/.env     # fill in AWS keys, KB creds, WEB_API_TOKEN, etc.
+
+# 1) Backend (web channel)
+python channels/web/app.py             # serves http://localhost:8000
+
+# 2) Frontend test UI (static) — serve the web_test_ui folder on port 5500, e.g.
+python -m http.server 5500             # run inside web_test_ui/, then open http://localhost:5500
 ```
 
-Open:
-- http://localhost:8002/docs — Swagger UI (OpenAPI spec)
-- http://localhost:8002/health — Liveness probe
+- Health check: http://localhost:8000/health
+- Swagger: http://localhost:8000/docs
+- The test UI has a password gate (`axis@2026`) and a **Client ID** field (the customer's
+  Sub-Account ID). Leave Client ID blank for pre-login flows; set it for account flows.
+
+> Backend code changes need an `app.py` restart (no hot reload). Frontend changes just need a
+> browser reload. There is no deployment tooling here — AgentCore deployment is handled separately.
 
 ---
 
-## API Contract (for Simcomm team)
+## Request / response contract (`POST /api/chat`)
 
-Full spec: [`docs/openapi.yaml`](docs/openapi.yaml)  
-Postman collection: [`docs/ASL_Web_Chatbot_PreLogin.postman_collection.json`](docs/ASL_Web_Chatbot_PreLogin.postman_collection.json)
+Auth: `Authorization: Bearer <WEB_API_TOKEN>`
 
-### Key Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/v1/web/chat` | Main chat endpoint (every customer turn) |
-| `POST` | `/api/v1/web/chat/end` | End-chat notification |
-| `GET`  | `/api/v1/web/health` | Liveness probe (no auth) |
-| `POST` | `/internal/message` | Test endpoint (no auth) |
-
-### Auth
-
+Request:
+```json
+{
+  "Conversationid": "CSR0122XNRRMENM4",
+  "Message": "What are your support hours?",
+  "Event": "Incoming message",
+  "Channel": "WEB",
+  "timestamp": "2026-08-13T09:15:00.000Z",
+  "Client_ID": "6033593"
+}
 ```
-Authorization: Bearer <WEB_API_TOKEN>
+- `Conversationid` — session id (which chat).
+- `Client_ID` — the customer's **Sub-Account ID** (identity). Optional overall, but **required for
+  account flows**; when present the session is treated as logged-in. The backend never asks the
+  customer for it in chat.
+
+Response (eventid `1001` normal reply):
+```json
+{
+  "eventid": "1001",
+  "conversation_id": "CSR0122XNRRMENM4",
+  "message": "...",
+  "messagetype": "text",
+  "quickReplies": {
+    "reference": "<flow_state>",
+    "options": [{ "type": "quickReplyPostback", "identifier": "...", "title": "...", "payload": {...} }]
+  }
+}
 ```
+`eventid` `1002` = escalate to a live agent.
 
-Token is generated by the ASL platform team and shared with Simcomm.  
-Set `WEB_API_TOKEN` in `config/.env`.
-
-### Response Events
-
-| `eventid` | Meaning |
-|-----------|---------|
-| `1001` | Normal bot reply — continue conversation |
-| `1002` | Escalate to WxCC — route to live agent |
+End-chat notification: `POST /api/chat/end` with `{ "conversation_id": "...", "Client_ID": "...", "endedBy": "...", "resolution": "..." }` → `200 {"status":"acknowledged"}`.
 
 ---
 
-## Project Structure
+## Flows
 
-```
-chatbot_web/
-├── app.py                    # FastAPI entry point (port 8002)
-├── models.py                 # All shared Pydantic models
-├── requirements.txt
-├── config/
-│   ├── .env                  # Local dev config
-│   └── .env.example          # Template
-├── entry/
-│   └── handler.py            # Main entry point — greeting + intent routing
-├── src/
-│   ├── api/
-│   │   ├── web_routes.py     # /api/v1/web/* — Simcomm integration
-│   │   └── internal_routes.py # /internal/* — test endpoints
-│   ├── core/
-│   │   ├── session_store.py  # Pluggable session backend (memory/postgres/agentcore)
-│   │   └── llm.py            # AWS Bedrock (Claude) wrapper
-│   ├── flows/
-│   │   ├── bank_query/       # Bank Query flow
-│   │   ├── how_to_trade/     # How To Trade flow (multi-turn)
-│   │   ├── need_more_help/   # Need More Help → escalation
-│   │   └── edit_profile/     # Edit Profile → deeplink
-│   └── shared/
-│       └── session_end.py    # Shared "Go back / End chat" block
-└── docs/
-    ├── openapi.yaml          # OpenAPI 3.1 spec (hand to Simcomm)
-    ├── ASL_Web_Chatbot_PreLogin.postman_collection.json
-    └── DB_SCHEMA.md          # Database schema design
-```
+**Pre-login (no Client ID):** Bank Query, How To Trade, Edit Profile, Need More Help, plus FAQ and greeting.
+**Post-login (Client ID required):** Statement, Order Status, Brokerage & Charges, Account Details, IPO, Login Query, Closure.
+
+Account flows requested without a Client ID return a brief "please sign in" notice + the pre-login menu (no OTP).
 
 ---
 
-## Session Store
+## Models (Bedrock)
 
-| Backend | When to use | Config |
-|---------|-------------|--------|
-| `memory` | Local dev / single instance | Default — no config needed |
-| `postgres` | Staging / multi-instance | `SESSION_BACKEND=postgres` + `SESSION_DB_URL=...` |
-| `agentcore` | Production | `SESSION_BACKEND=agentcore` + `AGENTCORE_MEMORY_ENDPOINT=...` |
+| Purpose | Model | Env var |
+|---------|-------|---------|
+| Intent classification / routing + slot extraction | Claude 3 Haiku (`anthropic.claude-3-haiku-20240307-v1:0`) | `INTENT_MODEL_ID` |
+| Response / FAQ composition | Qwen (`qwen.qwen3-235b-a22b-2507-v1:0`) | `RESPONSE_MODEL_ID` |
+| FAQ retrieval | Bedrock Knowledge Base `JTGNRX1HDB` | `INTENT_KB_ID` |
 
-Session TTL: **15 minutes** (configurable via `SESSION_TTL_SECONDS`).
-
----
-
-## DB Schema
-
-See [`docs/DB_SCHEMA.md`](docs/DB_SCHEMA.md) for full schema design.
-
-Tables added to the shared Amazon RDS instance:
-- `web_chat_sessions` — live session store (Postgres backend)
-- `web_chat_logs` — full audit trail per turn
-- `web_escalation_logs` — escalation events
-
-All prefixed with `web_` — no conflict with email automation tables.
+Model calls use the main `AWS_*` credentials; Knowledge Base retrieval can use separate
+`KB_AWS_*` credentials (the KB lives in a different account). Both must allow the needed
+Bedrock actions (`bedrock:InvokeModel` for models; KB retrieve for the KB).
 
 ---
 
-## Environment Variables
+## Session store
+
+| Backend | Use | Config |
+|---------|-----|--------|
+| `memory` | local dev (default) | `SESSION_BACKEND=memory` |
+| `postgres` | staging / multi-instance | `SESSION_BACKEND=postgres` + `SESSION_DB_URL=...` |
+| `agentcore` | production | `SESSION_BACKEND=agentcore` |
+
+Session TTL default: 15 min (`SESSION_TTL_SECONDS`). "New chat" = new `Conversationid` = fresh,
+unauthenticated session.
+
+---
+
+## Key environment variables
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `PORT` | No | Server port (default: 8002) |
-| `WEB_API_TOKEN` | Yes (prod) | Bearer token shared with Simcomm |
-| `AWS_REGION` | Yes | e.g. `ap-south-1` |
-| `AWS_ACCESS_KEY_ID` | Yes | Bedrock access |
-| `AWS_SECRET_ACCESS_KEY` | Yes | Bedrock access |
-| `ACTIVE_MODEL_ID` | No | Bedrock model ID (default: Claude 3 Haiku) |
-| `SESSION_BACKEND` | No | `memory` / `postgres` / `agentcore` |
-| `SESSION_DB_URL` | Postgres only | PostgreSQL connection string |
-| `AGENTCORE_MEMORY_ENDPOINT` | AgentCore only | AgentCore Memory API URL |
-| `AXIS_DIRECT_PORTAL_URL` | No | Portal deeplink for Edit Profile |
-| `AXIS_BANK_CARE_NUMBER` | No | Bank Query redirect phone |
+| `WEB_API_TOKEN` | yes | Bearer token for `/api/chat` |
+| `AWS_REGION` | yes | e.g. `ap-south-1` |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN` | yes | Bedrock model invocation |
+| `KB_AWS_ACCESS_KEY_ID` / `KB_AWS_SECRET_ACCESS_KEY` / `KB_AWS_SESSION_TOKEN` | KB in a different account | Knowledge Base retrieval |
+| `INTENT_KB_ID` | yes (FAQ) | Knowledge Base id (default `JTGNRX1HDB`) |
+| `RESPONSE_MODEL_ID` / `INTENT_MODEL_ID` | no | override the Qwen defaults |
+| `SESSION_BACKEND` | no | `memory` / `postgres` / `agentcore` |
+| `PORT` | no | web server port (default 8000) |
 
----
-
-## Testing
-
-```bash
-# 1. Start the server
-python app.py
-
-# 2. Import the Postman collection
-#    docs/ASL_Web_Chatbot_PreLogin.postman_collection.json
-#    Set BASE_URL = http://localhost:8002
-
-# 3. Or use curl:
-# Greeting
-curl -X POST http://localhost:8002/internal/message \
-  -H "Content-Type: application/json" \
-  -d '{"conversation_id":"test-001","raw_input":"hi"}'
-
-# Bank Query
-curl -X POST http://localhost:8002/internal/message \
-  -H "Content-Type: application/json" \
-  -d '{"conversation_id":"test-001","raw_input":"Bank Query","input_type":"quick_reply"}'
-
-# Escalation
-curl -X POST http://localhost:8002/internal/message \
-  -H "Content-Type: application/json" \
-  -d '{"conversation_id":"test-002","raw_input":"I need to talk to someone"}'
-```
-
----
-
-## Integration Checklist for Simcomm
-
-- [ ] Receive API endpoint (gateway domain) from ASL platform team
-- [ ] Receive `WEB_API_TOKEN` from ASL platform team
-- [ ] Import Postman collection and run against the endpoint
-- [ ] Implement `eventid: 1001` handling (display message + quick replies)
-- [ ] Implement `eventid: 1002` handling (route to WxCC task)
-- [ ] Send `POST /api/v1/web/chat/end` on widget close
-- [ ] Set `input_type: "quick_reply"` when customer taps a button
-- [ ] Set `input_type: "free_text"` when customer types
+Secrets live in `config/.env` (gitignored). Never commit real credentials — only `config/.env.example`.

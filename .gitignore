@@ -27,3 +27,9 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# ── Channel adapters & test UI (NOT deployed to AgentCore) ──
+# These stay on disk for local testing (python channels/web/app.py) but are
+# kept out of this deploy branch. The brain in agent/ is what AgentCore runs.
+channels/
+web_test_ui/

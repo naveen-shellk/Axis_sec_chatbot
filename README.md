@@ -10,45 +10,47 @@ flow logic, LLM calls, Knowledge Base retrieval, and API/gateway calls live in `
 
 ## Project structure
 
+This branch holds **only the deployable agent** — the channel-agnostic brain plus what
+AgentCore needs to run it:
+
 ```
 chatbot_langchain/
 ├── agent/                     # THE BRAIN (channel-agnostic; what AgentCore deploys)
 │   ├── handler.py             # handle_message() — greeting menu, intent routing, flow dispatch
 │   ├── models.py              # shared Pydantic models (request/response/session)
-│   ├── entrypoint.py          # thin AgentCore Runtime entry (deploy-time; lazy SDK import)
+│   ├── entrypoint.py          # AgentCore Runtime entry (process_turn; lazy SDK import)
 │   ├── core/                  # llm, langchain_agent, kb_retrieval, faq, conversation, session_store, tools
 │   ├── flows/                 # one package per flow (statement, brokerage, order_status, closure, ...)
 │   ├── gateways/              # API clients (gateway_client, statement_api, order_api, customer_api)
 │   ├── shared/                # session_end, shared helpers
 │   └── utils/                 # token_logger
-├── channels/                  # THIN transport adapters (no business logic)
-│   └── web/                   # FastAPI web channel (local testing + Simcomm/WebX)
-│       ├── app.py             # FastAPI server (POST /api/chat, /oauth, /health, /internal)
-│       ├── web_routes.py      # /api/chat, /api/chat/end, /health
-│       ├── oauth_routes.py    # POST /oauth/token
-│       └── internal_routes.py # /internal/* (dev only)
-├── web_test_ui/               # static test UI (index.html) — local manual testing
-├── config/                    # .env (local secrets) + .env.example (template)
-├── db/                        # schema.sql
-├── logs/                      # turn logs (log.txt)
-└── requirements.txt
+├── config/                    # .env.example (template); real .env is local-only (gitignored)
+├── requirements.txt
+└── README.md
 ```
 
-**Why this split:** the agent is a single self-contained package AgentCore can run via
-`agent/entrypoint.py`, while each channel (web now, WhatsApp later) sits in `channels/` and just
-calls `agent.handler.handle_message()`. Adding a new channel does not touch the brain.
+**Channel adapters are not in this branch.** The web adapter (`channels/web/`, FastAPI) and the
+local `web_test_ui/` live on disk for local testing and in the `version-1` branch, but they are
+gitignored here. Each channel (web now, WhatsApp later) will be deployed as its own microservice
+that calls the agent — the brain in `agent/` never changes when a channel is added.
+
+**Why this split:** the agent is a single self-contained package AgentCore runs via
+`agent/entrypoint.py` (`process_turn(payload) -> Simcomm dict`). It reads all configuration from
+environment variables, so AgentCore just needs the `agent/` package, `requirements.txt`, and the
+env vars (template in `config/.env.example`).
 
 ---
 
 ## Run locally
 
-From the `chatbot_langchain/` root:
+Local testing uses the web channel adapter, which is **not committed to this branch** (it lives
+on disk and in the `version-1` branch). From the `chatbot_langchain/` root:
 
 ```bash
 pip install -r requirements.txt
 cp config/.env.example config/.env     # fill in AWS keys, KB creds, WEB_API_TOKEN, etc.
 
-# 1) Backend (web channel)
+# 1) Backend (web channel adapter — local only)
 python channels/web/app.py             # serves http://localhost:8000
 
 # 2) Frontend test UI (static) — serve the web_test_ui folder on port 5500, e.g.

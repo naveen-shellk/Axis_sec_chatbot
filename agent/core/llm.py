@@ -47,6 +47,21 @@ _INTENT_TEMPERATURE = float(os.getenv("INTENT_TEMPERATURE", "0.0"))  # determini
 _MAX_TOKENS        = int(os.getenv("CHATBOT_MAX_TOKENS",  "1024"))
 _TEMPERATURE       = float(os.getenv("CHATBOT_TEMPERATURE", "0.2"))
 
+# ── Bedrock Guardrail ─────────────────────────────────────────────────────────
+# Reuse thor's PII guardrail (asl-aws-dev-orion-bot-bedrock-guardrail-pii) by
+# default. Applied to every Converse call via guardrailConfig, so it covers all
+# channels (web + WhatsApp) at once. Set BEDROCK_GUARDRAIL_ID="" to disable.
+_GUARDRAIL_ID      = os.getenv("BEDROCK_GUARDRAIL_ID", "dsk26mvkvfwa")
+_GUARDRAIL_VERSION = os.getenv("BEDROCK_GUARDRAIL_VERSION", "DRAFT")
+
+
+def _guardrail_config() -> dict[str, Any] | None:
+    """Converse guardrailConfig block, or None when no guardrail is configured."""
+    if not _GUARDRAIL_ID:
+        return None
+    return {"guardrailIdentifier": _GUARDRAIL_ID, "guardrailVersion": _GUARDRAIL_VERSION}
+
+
 _client: Any = None
 
 
@@ -62,15 +77,20 @@ def _invoke(model_id: str, system: str, messages: list[dict[str, Any]],
     """Shared Bedrock Converse call used by both model wrappers."""
     client = _get_client()
 
-    response = client.converse(
-        modelId=model_id,
-        system=[{"text": system}],
-        messages=messages,
-        inferenceConfig={
+    _kwargs: dict[str, Any] = {
+        "modelId": model_id,
+        "system": [{"text": system}],
+        "messages": messages,
+        "inferenceConfig": {
             "maxTokens":   _MAX_TOKENS,
             "temperature": _TEMPERATURE,
         },
-    )
+    }
+    _gr = _guardrail_config()
+    if _gr:
+        _kwargs["guardrailConfig"] = _gr   # thor PII guardrail (all channels)
+
+    response = client.converse(**_kwargs)
 
     raw_text: str = response["output"]["message"]["content"][0]["text"].strip()
     usage = response.get("usage", {})
@@ -184,15 +204,20 @@ def call_llm_stream(
     client = _get_client()
 
     logger.debug("[LLM:stream] using %s", _RESPONSE_MODEL_ID)
-    response = client.converse_stream(
-        modelId=_RESPONSE_MODEL_ID,
-        system=[{"text": system}],
-        messages=messages,
-        inferenceConfig={
+    _skwargs: dict[str, Any] = {
+        "modelId": _RESPONSE_MODEL_ID,
+        "system": [{"text": system}],
+        "messages": messages,
+        "inferenceConfig": {
             "maxTokens":   _MAX_TOKENS,
             "temperature": _TEMPERATURE,
         },
-    )
+    }
+    _gr = _guardrail_config()
+    if _gr:
+        _skwargs["guardrailConfig"] = _gr   # thor PII guardrail (all channels)
+
+    response = client.converse_stream(**_skwargs)
 
     full_text = ""
     in_tok = 0

@@ -227,19 +227,35 @@ def handle_message(
         })
         save_session(conversation_id, state)
 
-    # ── Global "End Chat" — works from ANY flow state ─────────────────────────
-    _GLOBAL_END_PHRASES = {"end chat", "endchat", "end the chat", "end conversation"}
-    if raw_input.strip().lower() in _GLOBAL_END_PHRASES:
+    # ── Global feedback capture — the message AFTER "End Chat" is the feedback ─
+    # When the previous turn asked for feedback (flow_state=awaiting_feedback),
+    # the current message IS the feedback: store it, then end the chat.
+    if state.flow_state == "awaiting_feedback":
+        from agent.shared.feedback import save_feedback
+        save_feedback(conversation_id, raw_input)
         clear_session(conversation_id)
-        logger.info("[ENTRY] conv=%s → global end chat", conversation_id)
+        logger.info("[ENTRY] conv=%s → feedback captured → end chat", conversation_id)
         return InternalMessageResponse(
-            reply_message=(
-                "Thank you for reaching out to Axis Direct! "
-                "Have a great day. If you need help again, we're always here."
-            ),
+            reply_message="Thank you for your feedback! Have a great day. 😊",
             quick_reply_options=[],
             flow_state="ended",
             status="end",
+            eventid="1001",
+        )
+
+    # ── Global "End Chat" — works from ANY flow state ─────────────────────────
+    # Do NOT end immediately: ask for feedback first. The next message is stored
+    # as the feedback (handled by the awaiting_feedback branch above), then the
+    # chat ends. A customer who ignores the prompt is cleaned up by the 15-min TTL.
+    _GLOBAL_END_PHRASES = {"end chat", "endchat", "end the chat", "end conversation"}
+    if raw_input.strip().lower() in _GLOBAL_END_PHRASES:
+        save_session(conversation_id, state.model_copy(update={"flow_state": "awaiting_feedback"}))
+        logger.info("[ENTRY] conv=%s → end chat → asking for feedback", conversation_id)
+        return InternalMessageResponse(
+            reply_message="Before you leave, help us with your feedback 🙏",
+            quick_reply_options=[],
+            flow_state="awaiting_feedback",
+            status="ok",
             eventid="1001",
         )
 

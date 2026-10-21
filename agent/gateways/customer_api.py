@@ -13,6 +13,7 @@ from typing import Any
 
 from agent.gateways.gateway_client import (
     get_customer_profile as _gw_get_profile,
+    validate_customer,
     mask_email,
     mask_mobile,
     get_masked_email,
@@ -112,6 +113,7 @@ def mask_pan(pan: str) -> str:
 __all__ = [
     "CustomerProfile",
     "get_customer_profile",
+    "validate_customer",
     "mask_email",
     "mask_mobile",
     "mask_account",

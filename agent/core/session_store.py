@@ -1,12 +1,11 @@
 """
 chatbot_web/src/core/session_store.py
 --------------------------------------
-Session store for the web channel — three backends, same public interface.
+Session store for the web channel — PostgreSQL only.
 
-Backend selection via SESSION_BACKEND env var:
-  memory    — in-process dict  (default; dev / single-instance)
-  postgres  — PostgreSQL via psycopg2 (staging / multi-instance)
-  agentcore — AWS BedrockAgentCore Memory API (production)
+Sessions always persist in the DB via SESSION_DB_URL (psycopg2). There is no
+backend switch to set. The in-memory and AgentCore Memory helpers remain in this
+file for reference/history but are no longer wired into the public API.
 
 AgentCore short-term memory model:
   - One Memory resource per deployment (AGENTCORE_MEMORY_ID)
@@ -114,9 +113,15 @@ def _ensure_pg_tables(conn) -> None:
             CREATE TABLE IF NOT EXISTS web_chatbot_sessions (
                 conversation_id TEXT PRIMARY KEY,
                 state_json      TEXT    NOT NULL,
-                updated_at      FLOAT   NOT NULL
+                updated_at      FLOAT   NOT NULL,
+                status          TEXT    NOT NULL DEFAULT 'active'
             );
         """)
+        # Backfill the column on pre-existing tables (no-op if it already exists).
+        cur.execute(
+            "ALTER TABLE web_chatbot_sessions "
+            "ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';"
+        )
 
 
 def _pg_get(conversation_id: str) -> SessionState | None:
@@ -124,7 +129,8 @@ def _pg_get(conversation_id: str) -> SessionState | None:
         conn = _get_pg_conn()
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT state_json, updated_at FROM web_chatbot_sessions WHERE conversation_id = %s",
+                "SELECT state_json, updated_at FROM web_chatbot_sessions "
+                "WHERE conversation_id = %s AND status <> 'ended'",
                 (conversation_id,),
             )
             row = cur.fetchone()
@@ -146,11 +152,12 @@ def _pg_save(conversation_id: str, state: SessionState) -> None:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO web_chatbot_sessions (conversation_id, state_json, updated_at)
-                VALUES (%s, %s, %s)
+                INSERT INTO web_chatbot_sessions (conversation_id, state_json, updated_at, status)
+                VALUES (%s, %s, %s, 'active')
                 ON CONFLICT (conversation_id) DO UPDATE
                   SET state_json = EXCLUDED.state_json,
-                      updated_at = EXCLUDED.updated_at
+                      updated_at = EXCLUDED.updated_at,
+                      status     = 'active'
                 """,
                 (conversation_id, state.model_dump_json(), time.time()),
             )
@@ -160,12 +167,15 @@ def _pg_save(conversation_id: str, state: SessionState) -> None:
 
 
 def _pg_clear(conversation_id: str) -> None:
+    # End the session WITHOUT deleting the row (kept for audit, same as WhatsApp).
+    # get() filters status='ended', so the next turn starts a fresh session.
     try:
         conn = _get_pg_conn()
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM web_chatbot_sessions WHERE conversation_id = %s",
-                (conversation_id,),
+                "UPDATE web_chatbot_sessions SET status = 'ended', updated_at = %s "
+                "WHERE conversation_id = %s",
+                (time.time(), conversation_id),
             )
     except Exception as exc:
         logger.error("[SESSION:pg] clear failed: %s", exc)
@@ -495,33 +505,15 @@ def create_agentcore_memory(
 
 
 # =============================================================================
-# Backend selection — runs once at import time
+# Backend — PostgreSQL only (no switch, nothing to set)
 # =============================================================================
+# Sessions always live in the DB via SESSION_DB_URL. The in-memory / AgentCore
+# helpers below remain in the file for reference but are no longer wired in.
 
-_backend = SESSION_BACKEND
-
-if _backend == "postgres":
-    if SESSION_DB_URL:
-        logger.info("[SESSION_STORE] Backend: PostgreSQL")
-    else:
-        logger.warning(
-            "[SESSION_STORE] SESSION_BACKEND=postgres but SESSION_DB_URL not set "
-            "— falling back to in-memory"
-        )
-        _backend = "memory"
-
-elif _backend == "agentcore":
-    if AGENTCORE_MEMORY_ID:
-        logger.info("[SESSION_STORE] Backend: AgentCore Memory (memory_id=%s)", AGENTCORE_MEMORY_ID)
-    else:
-        logger.warning(
-            "[SESSION_STORE] SESSION_BACKEND=agentcore but AGENTCORE_MEMORY_ID not set "
-            "— falling back to in-memory"
-        )
-        _backend = "memory"
-
+if SESSION_DB_URL:
+    logger.info("[SESSION_STORE] Backend: PostgreSQL")
 else:
-    logger.info("[SESSION_STORE] Backend: in-memory")
+    logger.warning("[SESSION_STORE] SESSION_DB_URL not set — DB calls will fail until configured")
 
 
 # =============================================================================
@@ -529,32 +521,18 @@ else:
 # =============================================================================
 
 def get_session(conversation_id: str) -> SessionState | None:
-    """Load session by conversation_id. Returns None if not found or expired."""
-    if _backend == "postgres":
-        return _pg_get(conversation_id)
-    if _backend == "agentcore":
-        return _agentcore_get(conversation_id)
-    return _mem_get(conversation_id)
+    """Load session by conversation_id from the DB. None if not found/expired."""
+    return _pg_get(conversation_id)
 
 
 def save_session(conversation_id: str, state: SessionState) -> None:
-    """Persist session state. Called after every state change."""
-    if _backend == "postgres":
-        _pg_save(conversation_id, state)
-    elif _backend == "agentcore":
-        _agentcore_save(conversation_id, state)
-    else:
-        _mem_save(conversation_id, state)
+    """Persist session state to the DB. Called after every state change."""
+    _pg_save(conversation_id, state)
 
 
 def clear_session(conversation_id: str) -> None:
-    """Delete/invalidate session. Called on end-chat or session timeout."""
-    if _backend == "postgres":
-        _pg_clear(conversation_id)
-    elif _backend == "agentcore":
-        _agentcore_clear(conversation_id)
-    else:
-        _mem_clear(conversation_id)
+    """End (not delete) the session in the DB. Called on end-chat / timeout."""
+    _pg_clear(conversation_id)
 
 
 def get_or_create_session(conversation_id: str) -> SessionState:

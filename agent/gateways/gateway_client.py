@@ -85,6 +85,8 @@ def _proxy_call(endpoint: str, body: dict) -> dict:
 # ── Direct HTTP base URLs (read from env, same as email automation) ───────────
 _CUSTOMER_PROFILE_URL  = os.getenv("CUSTOMER_PROFILE_URL",
                                    "https://cust-pvt-api.uat.asldt.in/customer-profile/details")
+_CUSTOMER_VALIDATE_URL = os.getenv("CUSTOMER_VALIDATE_URL",
+                                   "https://cust-pvt-api.uat.asldt.in/customer-profile/validate")
 _REPORTS_BASE_URL      = os.getenv("STATEMENT_REQUEST_URL",
                                    "https://reports-api.uat.asldt.in").rstrip("/exports").rstrip("/")
 if _REPORTS_BASE_URL.endswith("/exports"):
@@ -296,6 +298,86 @@ def _get_customer_profile_direct(sub_account_id: str) -> dict[str, Any]:
     except Exception as e:
         logger.error("[GW] get_customer_profile direct HTTP failed: %s", e)
         return {}
+
+
+# =============================================================================
+# customer-info-api___validate_customer
+# Phone / email -> Sub-Account ID. Used by the WhatsApp handler to resolve a
+# caller's identity before OTP. Accepts exactly ONE of mobile_no / email /
+# sub_account_id. Returns {"found": bool, "sub_account_id": str|None}.
+# =============================================================================
+
+def validate_customer(
+    mobile_no: str = "",
+    email: str = "",
+    sub_account_id: str = "",
+) -> dict[str, Any]:
+    """
+    Gateway → direct HTTP fallback. Returns {"found": bool, "sub_account_id": ...}.
+
+    Pass exactly one identifier. The live /customer-profile/validate endpoint
+    echoes {"found": true, "subAccountId": "..."} on a match.
+    """
+    body: dict[str, str] = {}
+    if sub_account_id:
+        body["subAccountId"] = sub_account_id
+    elif mobile_no:
+        body["mobileNo"] = mobile_no
+    elif email:
+        body["email"] = email
+    else:
+        return {"found": False, "sub_account_id": None}
+
+    logger.info("[GW] validate_customer %s", next(iter(body)))
+
+    # ── Try Gateway ───────────────────────────────────────────────────────────
+    try:
+        raw = call_tool("customer-info-api___validate_customer", body)
+        if not _is_vpc_error(raw):
+            data = raw.get("data", raw) if isinstance(raw, dict) else {}
+            sub = data.get("subAccountId") or data.get("sub_account_id")
+            if sub:
+                return {"found": True, "sub_account_id": str(sub)}
+            # Gateway reached the API but no match / unmapped params — fall back.
+            logger.warning("[GW] validate_customer Gateway returned no id — falling back")
+    except (MCPGatewayError, Exception) as e:
+        logger.warning("[GW] validate_customer Gateway error — falling back: %s", e)
+
+    # ── Direct HTTP fallback (local_test only) ────────────────────────────────
+    if not _direct_allowed():
+        _blocked("validate_customer")
+        return {"found": False, "sub_account_id": None}
+    return _validate_customer_direct(body)
+
+
+def _validate_customer_direct(body: dict[str, str]) -> dict[str, Any]:
+    """
+    Direct HTTP to cust-pvt-api.uat.asldt.in/customer-profile/validate.
+
+    The endpoint quirk: it requires the X-SubAccountID header to be PRESENT and
+    NON-EMPTY, but ignores its value for the lookup — so we send the standard
+    _customer_headers() placeholder ("000000") and resolve the real id by
+    mobileNo/email in the body. (Verified live: with the header a mobile/email
+    body returns {found, subAccountId}; without it -> 400 'sub account id is
+    missing'.)
+    """
+    try:
+        resp = _requests.post(
+            _CUSTOMER_VALIDATE_URL,
+            json=body,
+            headers=_customer_headers(),   # includes X-SubAccountID=000000
+            timeout=10,
+        )
+        logger.info("[GW] validate_customer direct HTTP status=%d", resp.status_code)
+        if resp.status_code == 200:
+            data = resp.json()
+            inner = data.get("data", data) if isinstance(data, dict) else {}
+            sub = inner.get("subAccountId") or inner.get("sub_account_id")
+            return {"found": bool(sub), "sub_account_id": str(sub) if sub else None}
+        return {"found": False, "sub_account_id": None}
+    except Exception as e:
+        logger.error("[GW] validate_customer direct HTTP failed: %s", e)
+        return {"found": False, "sub_account_id": None}
 
 
 # =============================================================================
